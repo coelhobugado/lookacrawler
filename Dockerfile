@@ -27,12 +27,13 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY package.json bun.lock tsconfig.json ./
-RUN bun install
+RUN bun install --frozen-lockfile
+
+# Install Playwright Chromium browser binaries before copying the source, so a
+# code change does not invalidate this layer and re-download Chromium.
+RUN bunx playwright install chromium
 
 COPY . .
-
-# Install Playwright Chromium browser binaries
-RUN bunx playwright install chromium
 
 EXPOSE 3000
 
