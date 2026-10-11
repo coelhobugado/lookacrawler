@@ -16,7 +16,8 @@ describe("LookaCrawler MCP Server HTTP/SSE Transport (index.ts)", () => {
 
     // Wait for the server to be ready
     let attempts = 0;
-    while (attempts < 30) {
+    // Up to ~14s: a cold start under a parallel test run can exceed 6s.
+    while (attempts < 70) {
       try {
         const res = await fetch(`http://127.0.0.1:${PORT}/health`);
         if (res.ok) break;
@@ -101,7 +102,8 @@ describe("LookaCrawler MCP Server Bearer Authentication", () => {
     );
 
     let attempts = 0;
-    while (attempts < 30) {
+    // Up to ~14s: a cold start under a parallel test run can exceed 6s.
+    while (attempts < 70) {
       try {
         const res = await fetch(`http://127.0.0.1:${AUTH_PORT}/health`, {
           headers: { Authorization: `Bearer ${SECRET_TOKEN}` },
