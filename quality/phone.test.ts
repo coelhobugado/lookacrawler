@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { classifyBrazilian, findPhones, normalizePhone, phoneKey } from "./phone.js";
+import { classifyBrazilian, countryToRegion, findPhones, normalizePhone, phoneKey } from "./phone.js";
 
 describe("Phone normalization (quality/phone.ts)", () => {
   test("normalizes Brazilian mobile and fixed lines to E.164", () => {
@@ -63,6 +63,15 @@ describe("Phone normalization (quality/phone.ts)", () => {
     expect(uk?.e164).toBe("+442079460958");
     expect(uk?.type).toBe("fixed");
     expect(normalizePhone("+44 7356 026050")?.type).toBe("mobile");
+  });
+
+  test("maps structured country fields to regions", () => {
+    expect(countryToRegion("BR")).toBe("BR");
+    expect(countryToRegion("Brasil")).toBe("BR");
+    expect(countryToRegion("United States")).toBe("US");
+    expect(countryToRegion("uk")).toBe("GB");
+    expect(countryToRegion("Atlantis")).toBeUndefined();
+    expect(countryToRegion(undefined)).toBeUndefined();
   });
 
   test("classifies Brazilian national numbers", () => {
