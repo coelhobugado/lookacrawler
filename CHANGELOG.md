@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- SSE server leaked sessions: Bun's `node:http` never emits `close` on the
+  response when a client disconnects, so slots were never freed and the server
+  answered `503` to everyone once `LOOKACRAWLER_SSE_MAX_SESSIONS` clients had
+  come and gone. Sessions are now released on the request's `close` too.
+- Link-heavy pages (news homepages) returned empty Markdown: link-density
+  pruning removed the whole content container (`bbc.com/news`: 0 chars). When
+  pruning strips >75% of the output, the page is re-rendered without it.
+- Tests are hermetic: a `bunfig.toml` preload gives them an in-memory cache DB
+  and stubbed DNS. Previously the suite wiped the real `crawler_cache.sqlite`
+  and failed offline; the CLI flag-order test now uses a local fixture.
+- Maps/enrichment error messages are in English like the rest of the product.
+
+### Changed
+- CI pins Bun 1.3.14 instead of `latest`.
+- Token-savings claim re-measured on 8 real pages (`benchmark-live.ts`):
+  median 90%, range 21–98%, replacing the synthetic ">73%".
+
 ## [1.1.2] — 2026-10-11
 
 Security patch release. Upgrading is recommended for anyone running the SSE

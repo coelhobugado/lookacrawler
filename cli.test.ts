@@ -21,13 +21,24 @@ describe("LookaCrawler CLI Suite", () => {
     expect(proc.stderr).toContain("Error: Missing target URL");
   });
 
-  test("lookacrawler extract correctly parses URL when flags precede it", () => {
-    const proc = spawnSync(
-      "bun",
-      ["run", "cli.ts", "extract", "--mode", "fast", "--no-cache", "https://example.com"],
-      { encoding: "utf8" }
-    );
-    expect(proc.status).toBe(0);
-    expect(proc.stdout).toContain("example");
+  test("lookacrawler extract correctly parses URL when flags precede it", async () => {
+    // Local fixture instead of example.com: the test must not depend on the network.
+    const server = Bun.serve({
+      port: 0,
+      fetch: () => new Response("<html><body><h1>example fixture</h1><p>Local page body.</p></body></html>", {
+        headers: { "content-type": "text/html" },
+      }),
+    });
+    try {
+      const proc = Bun.spawn(
+        ["bun", "run", "cli.ts", "extract", "--mode", "fast", "--no-cache", `http://127.0.0.1:${server.port}/`],
+        { cwd: import.meta.dir, env: { ...process.env, LOOKACRAWLER_ALLOW_LOCAL: "true" }, stdout: "pipe", stderr: "pipe" }
+      );
+      const stdout = await new Response(proc.stdout).text();
+      expect(await proc.exited).toBe(0);
+      expect(stdout).toContain("example fixture");
+    } finally {
+      server.stop(true);
+    }
   });
 });

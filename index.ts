@@ -804,6 +804,9 @@ async function main() {
         const sessionServer = buildMcpServer();
         const sessionId = transport.sessionId;
         sessions.set(sessionId, { transport, server: sessionServer });
+        // Bun's node:http never emits "close" on the response when the client
+        // disconnects — only on the request — so listen on both.
+        req.on("close", () => void releaseSession(sessionId));
         res.on("close", () => void releaseSession(sessionId));
         try {
           await sessionServer.connect(transport);

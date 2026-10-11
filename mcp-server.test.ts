@@ -226,10 +226,19 @@ describe("LookaCrawler MCP Server concurrent SSE sessions", () => {
   const MAX = 2;
   let proc: any = null;
 
+  // client.close() resolves before the server sees the socket close, so a slot
+  // freed by the previous test may still be held for a moment: retry 503s briefly.
   const connect = async () => {
-    const client = new Client({ name: "test-client", version: "1.0.0" });
-    await client.connect(new SSEClientTransport(new URL(`http://127.0.0.1:${PORT}/sse`)));
-    return client;
+    for (let attempt = 0; ; attempt++) {
+      const client = new Client({ name: "test-client", version: "1.0.0" });
+      try {
+        await client.connect(new SSEClientTransport(new URL(`http://127.0.0.1:${PORT}/sse`)));
+        return client;
+      } catch (err: any) {
+        if (err?.code !== 503 || attempt >= 20) throw err;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    }
   };
 
   beforeAll(async () => {
