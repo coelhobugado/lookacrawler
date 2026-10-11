@@ -49,17 +49,38 @@ export function sanitizeCsvRow(row: (string | number | boolean | null | undefine
   return row.map(sanitizeCsvCell);
 }
 
+export interface SafeCsvOptions {
+  /** Prepend a UTF-8 BOM so Excel detects the encoding (accents in pt-BR). */
+  bom?: boolean;
+  /** Field delimiter. Excel in pt-BR and most of Europe expects ";". */
+  delimiter?: "," | ";";
+  /** Decimal separator for numeric cells. Excel pt-BR reads "-16,68" as a number. */
+  decimalSeparator?: "." | ",";
+}
+
+// Written as a char code so the invisible character never sits in the source.
+const UTF8_BOM = String.fromCharCode(0xfeff);
+
+/** Preset for Excel with a Brazilian (or other comma-decimal) locale. */
+export const EXCEL_PT_BR: SafeCsvOptions = { bom: true, delimiter: ";", decimalSeparator: "," };
+
 /**
  * Converts headers and row data into a RFC 4180-compliant, formula-injection-safe CSV string.
  */
 export function toSafeCsv(
   headers: string[],
-  rows: (string | number | boolean | null | undefined)[][]
+  rows: (string | number | boolean | null | undefined)[][],
+  options: SafeCsvOptions = {}
 ): string {
+  const { bom = false, delimiter = ",", decimalSeparator = "." } = options;
+
   function escapeField(field: string | number | boolean | null | undefined): string {
-    const sanitized = sanitizeCsvCell(field);
+    let sanitized = sanitizeCsvCell(field);
+    if (typeof field === "number" && decimalSeparator === ",") {
+      sanitized = sanitized.replace(".", ",");
+    }
     if (
-      sanitized.includes(",") ||
+      sanitized.includes(delimiter) ||
       sanitized.includes('"') ||
       sanitized.includes("\n") ||
       sanitized.includes("\r")
@@ -69,8 +90,8 @@ export function toSafeCsv(
     return sanitized;
   }
 
-  const headerLine = headers.map(escapeField).join(",");
-  const rowLines = rows.map((row) => row.map((val) => escapeField(val)).join(","));
+  const headerLine = headers.map(escapeField).join(delimiter);
+  const rowLines = rows.map((row) => row.map((val) => escapeField(val)).join(delimiter));
 
-  return [headerLine, ...rowLines].join("\r\n");
+  return (bom ? UTF8_BOM : "") + [headerLine, ...rowLines].join("\r\n");
 }
