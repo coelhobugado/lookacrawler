@@ -155,6 +155,30 @@ export function classifyBrazilian(nationalNumber: string): PhoneType | null {
   return null;
 }
 
+const COUNTRY_NAMES: Record<string, CountryCode> = {
+  brasil: "BR", brazil: "BR", bra: "BR",
+  "united states": "US", "united states of america": "US", usa: "US", "estados unidos": "US",
+  "united kingdom": "GB", uk: "GB", england: "GB", scotland: "GB", wales: "GB", "reino unido": "GB",
+  portugal: "PT", canada: "CA", "canadá": "CA", argentina: "AR", chile: "CL", uruguay: "UY", uruguai: "UY",
+  paraguay: "PY", paraguai: "PY", mexico: "MX", "méxico": "MX", spain: "ES", espanha: "ES", "españa": "ES",
+  germany: "DE", alemanha: "DE", france: "FR", "frança": "FR", italy: "IT", "itália": "IT", ireland: "IE",
+  australia: "AU", "austrália": "AU",
+};
+
+/**
+ * Region code for a structured country field ("BR", "Brazil", "Brasil",
+ * "United States", ...). Returns undefined when unknown.
+ */
+export function countryToRegion(country: string | null | undefined): CountryCode | undefined {
+  if (!country) return undefined;
+  const value = country.trim();
+  if (/^[A-Za-z]{2}$/.test(value)) {
+    const code = value.toUpperCase();
+    return (code === "UK" ? "GB" : code) as CountryCode;
+  }
+  return COUNTRY_NAMES[value.toLowerCase()];
+}
+
 export function isValidBrazilianDdd(ddd: string | number): boolean {
   return BR_DDDS.has(Number(ddd));
 }
