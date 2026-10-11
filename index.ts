@@ -3,21 +3,15 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
-import {
-  extractFast,
-  extractDeep,
-  extractStructured,
-  batchExtract,
-  mapWebsite,
-  crawlWebsite,
-  type LinkFormat,
-  type ImageMode,
-  type PageAction,
-} from "./extractor.js";
-import { getCachedPage, setCachedPage, buildCacheKey, db } from "./cache.js";
+import type { LinkFormat, ImageMode, PageAction } from "./extractor.js";
+import { getCachedPage, setCachedPage, buildCacheKey, pruneExpiredCache, db } from "./cache.js";
 import { validateTargetUrl } from "./security.js";
 import { getMetrics, recordMetric } from "./metrics.js";
-import { closeBrowsers } from "./browser-manager.js";
+
+// The extraction pipeline (jsdom + playwright) takes ~2.5s to import. Loading it
+// on first use lets the MCP handshake complete immediately, the same way the
+// contacts/places/maps tools are already loaded.
+const loadExtractor = () => import("./extractor.js");
 
 /**
  * Initialize the LookaCrawler MCP Server
@@ -132,6 +126,7 @@ Markdown text. Cache hits are prefixed with a NOTE marker. Unsupported URLs (non
         }
       }
 
+      const { extractFast, extractDeep } = await loadExtractor();
       let markdown: string;
       if (mode === "fast") {
         markdown = await extractFast({
@@ -242,6 +237,7 @@ Structured JSON with per-url markdown/tokens/error and aggregate totals. Incompl
   },
   async ({ urls, mode, concurrency, css_selector, headers, cookies, proxy, max_retries }) => {
     try {
+      const { batchExtract } = await loadExtractor();
       const batchResult = await batchExtract({
         urls,
         mode,
@@ -347,6 +343,7 @@ JSON object with the requested fields (and/or metadata). Missing selectors are o
           return { content: [{ type: "text", text: cached }] };
         }
       }
+      const { extractStructured } = await loadExtractor();
       const structuredResult = await extractStructured({
         url,
         mode,
@@ -398,6 +395,7 @@ Returns a list of URLs with source and modification metadata. Useful for explori
   },
   async ({ url, max_links }) => {
     try {
+      const { mapWebsite } = await loadExtractor();
       const result = await mapWebsite({ url, maxLinks: max_links });
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
@@ -431,6 +429,7 @@ server.registerTool(
   },
   async ({ start_url, max_depth, max_pages, include_patterns, exclude_patterns, mode, link_format, image_mode }) => {
     try {
+      const { crawlWebsite } = await loadExtractor();
       const result = await crawlWebsite({
         startUrl: start_url,
         maxDepth: max_depth,
@@ -707,6 +706,10 @@ server.registerPrompt(
  * Start input/output transport for MCP client communication (stdio or SSE HTTP)
  */
 async function main() {
+  // Expired rows are otherwise only removed when the same key is read again,
+  // so the cache file grows without bound.
+  pruneExpiredCache();
+
   const args = process.argv.slice(2);
   let transportMode = "stdio";
   let port = 3000;
@@ -797,5 +800,9 @@ main().catch((error) => {
   process.exit(1);
 });
 
-process.once("SIGINT", () => void closeBrowsers().finally(() => process.exit(0)));
-process.once("SIGTERM", () => void closeBrowsers().finally(() => process.exit(0)));
+const shutdown = () =>
+  void import("./browser-manager.js")
+    .then(({ closeBrowsers }) => closeBrowsers())
+    .finally(() => process.exit(0));
+process.once("SIGINT", shutdown);
+process.once("SIGTERM", shutdown);
