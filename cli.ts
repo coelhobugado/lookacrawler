@@ -2,7 +2,7 @@
 import { formatJinaReader } from "./jina-format.js";
 
 import { readFile, writeFile } from "fs/promises";
-import { toSafeCsv } from "./csv-safe.js";
+import { EXCEL_PT_BR, toSafeCsv } from "./csv-safe.js";
 
 const VERSION = "1.1.2";
 
@@ -58,6 +58,7 @@ Options for 'enrich-batch':
 Options for 'places':
   --limit <n>                 Maximum places to return (default: 5).
   --csv                       Output as formula-injection-safe CSV instead of JSON.
+  --excel                     CSV for Excel pt-BR (BOM, ";" delimiter, decimal comma). Implies --csv.
   --output, -o <file>         Write output to a file.
 
 Options for 'map':
@@ -224,7 +225,8 @@ async function runCli() {
     }
     const query = positionalUrls.join(" ");
     const limit = getOption(args, "--limit") ? parseInt(getOption(args, "--limit")!, 10) : 5;
-    const isCsv = args.includes("--csv");
+    const isExcel = args.includes("--excel");
+    const isCsv = isExcel || args.includes("--csv");
     const outputFile = getOption(args, "--output") || getOption(args, "-o");
 
     try {
@@ -236,7 +238,7 @@ async function runCli() {
           p.title, p.address ?? "", p.phone ?? "", p.website ?? "",
           p.rating ?? "", p.reviewCount ?? "", p.latitude ?? "", p.longitude ?? "", p.url ?? "",
         ]);
-        outputText = toSafeCsv(headers, rows);
+        outputText = toSafeCsv(headers, rows, isExcel ? EXCEL_PT_BR : {});
       } else {
         outputText = JSON.stringify(result, null, 2);
       }
