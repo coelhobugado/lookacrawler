@@ -23,6 +23,8 @@ export function isPrivateAddress(address: string): boolean {
   }
 
   const normalized = address.toLowerCase().replace(/^\[|\]$/g, "");
+  // Hostnames such as fda.gov or fc2.com must not hit the IPv6 prefix checks below.
+  if (isIP(normalized) !== 6) return false;
   if (normalized.startsWith("::ffff:")) return isPrivateAddress(normalized.slice(7));
   if (normalized.startsWith("::") && isIP(normalized.slice(2)) === 4) {
     return isPrivateAddress(normalized.slice(2));
