@@ -94,13 +94,14 @@ Markdown text. Cache hits are prefixed with a NOTE marker. Unsupported URLs (non
           .array(
             z.object({
               type: z.enum(["click", "scroll", "wait", "fill"]).describe("Action type"),
-              selector: z.string().optional().describe("CSS selector for click/fill"),
+              selector: z.string().max(500).optional().describe("CSS selector for click/fill"),
               direction: z.enum(["up", "down"]).optional().describe("Scroll direction"),
-              pixels: z.number().optional().describe("Pixels to scroll"),
-              milliseconds: z.number().optional().describe("Milliseconds to wait"),
-              value: z.string().optional().describe("Text value to fill into input"),
+              pixels: z.number().int().min(0).max(20000).optional().describe("Pixels to scroll (max 20000)"),
+              milliseconds: z.number().int().min(0).max(10000).optional().describe("Milliseconds to wait (max 10000)"),
+              value: z.string().max(5000).optional().describe("Text value to fill into input"),
             })
           )
+          .max(20)
           .optional()
           .describe("Optional pre-crawl automation actions for mode='deep' (e.g. click cookie consent, load more, scrolling)."),
       },
@@ -424,8 +425,8 @@ Returns a list of URLs with source and modification metadata. Useful for explori
         start_url: z.string().url().describe("Root URL to start the recursive crawl from."),
         max_depth: z.number().int().min(1).max(5).default(2).optional().describe("Maximum link traversal depth (default: 2)."),
         max_pages: z.number().int().min(1).max(20).default(5).optional().describe("Maximum total pages to crawl (default: 5, max: 20)."),
-        include_patterns: z.array(z.string()).optional().describe("Regex patterns that candidate URLs must match (e.g. ['/docs/'])."),
-        exclude_patterns: z.array(z.string()).optional().describe("Regex patterns for URLs to ignore (e.g. ['/login', '/tags/'])."),
+        include_patterns: z.array(z.string().max(200)).max(10).optional().describe("Substring patterns (`*` = wildcard) that candidate URLs must match (e.g. ['/docs/']). Max 10."),
+        exclude_patterns: z.array(z.string().max(200)).max(10).optional().describe("Substring patterns (`*` = wildcard) for URLs to ignore (e.g. ['/login', '/tags/']). Max 10."),
         mode: z.enum(["fast", "deep"]).default("fast").describe("Crawl mode ('fast' native fetch or 'deep' Playwright browser)."),
         link_format: z.enum(["inline", "references", "strip"]).default("inline").optional().describe("Formatting of extracted hyperlinks."),
         image_mode: z.enum(["ignore", "alt_only", "markdown"]).default("ignore").optional().describe("Formatting of images."),

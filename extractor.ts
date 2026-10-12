@@ -24,6 +24,9 @@ function hasEntries(obj?: Record<string, any>): boolean {
 export type LinkFormat = "inline" | "references" | "strip";
 export type ImageMode = "ignore" | "alt_only" | "markdown";
 
+const MAX_ACTIONS = 20;
+const ACTIONS_TOTAL_MS = 30_000;
+
 export type PageAction =
   | { type: "click"; selector: string; timeoutMs?: number }
   | { type: "scroll"; direction?: "up" | "down"; pixels?: number }
@@ -695,21 +698,27 @@ async function extractDeepOnce(options: DeepExtractOptions): Promise<string> {
 
           // Execute pre-crawl automation actions if defined (e.g. cookie consent, load more, scrolling)
           if (actions && actions.length > 0) {
-            for (const act of actions) {
+            // Bounded so one request cannot hold a browser context indefinitely
+            // (the MCP schema enforces the same caps; this covers library callers).
+            const deadline = Date.now() + ACTIONS_TOTAL_MS;
+            for (const act of actions.slice(0, MAX_ACTIONS)) {
+              const left = deadline - Date.now();
+              if (left <= 0) break;
+              const stepMs = Math.min(3000, left);
               try {
                 if (act.type === "click" && act.selector) {
-                  await page.waitForSelector(act.selector, { timeout: act.timeoutMs || 3000 }).catch(() => {});
-                  await page.click(act.selector).catch(() => {});
+                  await page.waitForSelector(act.selector, { timeout: Math.min(act.timeoutMs || 3000, stepMs) }).catch(() => {});
+                  await page.click(act.selector, { timeout: stepMs }).catch(() => {});
                 } else if (act.type === "scroll") {
-                  const px = act.pixels ?? 800;
+                  const px = Math.min(Math.max(act.pixels ?? 800, 0), 20000);
                   const dy = act.direction === "up" ? -px : px;
                   await page.evaluate((y) => window.scrollBy({ top: y, behavior: "smooth" }), dy);
-                  await page.waitForTimeout(400);
+                  await page.waitForTimeout(Math.min(400, left));
                 } else if (act.type === "wait" && act.milliseconds) {
-                  await page.waitForTimeout(act.milliseconds);
+                  await page.waitForTimeout(Math.min(act.milliseconds, 10000, left));
                 } else if (act.type === "fill" && act.selector) {
-                  await page.waitForSelector(act.selector, { timeout: 3000 }).catch(() => {});
-                  await page.fill(act.selector, act.value || "").catch(() => {});
+                  await page.waitForSelector(act.selector, { timeout: stepMs }).catch(() => {});
+                  await page.fill(act.selector, act.value || "", { timeout: stepMs }).catch(() => {});
                 }
               } catch {
                 /* non-critical action failure */
