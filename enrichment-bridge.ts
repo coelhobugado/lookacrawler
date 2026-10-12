@@ -1,8 +1,11 @@
-import { extractFast, extractDeep, type LinkFormat, type ImageMode } from "./extractor.js";
+import { fetchRawHtml, processHtmlToMarkdown, type LinkFormat, type ImageMode } from "./extractor.js";
 import { getCachedPage, setCachedPage, buildCacheKey } from "./cache.js";
 import { validateTargetUrl } from "./security.js";
 import { extractContacts } from "./contacts.js";
 import type { GoogleMapsLead } from "./maps-bridge.js";
+import { countryToRegion, findPhones, normalizePhone } from "./quality/phone.js";
+import { cleanEmails, findEmails } from "./quality/email.js";
+import { formatCnpj } from "./quality/cnpj.js";
 
 export interface EnrichedLeadResult {
   title: string;
@@ -33,56 +36,58 @@ export interface EnrichedLeadResult {
   sourcePagesCrawled: string[];
   enrichmentSuccess: boolean;
   error?: string;
+
+  // Normalized details
+  /** DV-valid CNPJs printed on the company site, unmasked. */
+  cnpjFromSite?: string[];
 }
 
-// Bounded and anchored so long tokens without "@" are not rescanned at every offset.
-const EMAIL_REGEX = /(?<![\w.%+-])[\w.%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})*\.[A-Za-z]{2,24}\b/g;
-const INTL_PHONE_REGEX = /(?:\+?[0-9]{1,4}[\s.-]?)?(?:\([0-9]{2,4}\)[\s.-]?)?[0-9]{3,5}[\s.-]?[0-9]{3,4}/g;
+type EnrichOptions = {
+  mode?: "fast" | "deep";
+  crawlContactPages?: boolean;
+  linkFormat?: LinkFormat;
+  imageMode?: ImageMode;
+};
 
 /**
- * Filter out false-positive, CDN, or image placeholder emails.
+ * Fetch the raw home HTML once. Fast mode escalates to the browser when the
+ * plain fetch is stopped by an anti-bot page, mirroring extractFast.
  */
-function cleanEmails(rawEmails: string[]): string[] {
-  const ignoredDomains = [
-    "sentry.io",
-    "wixpress.com",
-    "example.com",
-    "domain.com",
-    "email.com",
-    "schema.org",
-    "wordpress.org",
-    "gravatar.com",
-  ];
-  const ignoredExts = [".png", ".jpg", ".jpeg", ".svg", ".webp", ".avif", ".gif", ".pdf"];
-
-  const set = new Set<string>();
-  for (const e of rawEmails) {
-    const lower = e.toLowerCase().trim();
-    if (ignoredExts.some((ext) => lower.endsWith(ext))) continue;
-    const parts = lower.split("@");
-    if (parts.length !== 2) continue;
-    const domain = parts[1];
-    if (ignoredDomains.some((d) => domain.includes(d))) continue;
-    set.add(lower);
+async function fetchHomeHtml(url: string, mode: "fast" | "deep"): Promise<string> {
+  try {
+    return await fetchRawHtml(url, mode);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (mode === "fast" && /Anti-Bot protection|cloudflare|just a moment/i.test(message)) {
+      return fetchRawHtml(url, "deep", { maxRetries: 2 });
+    }
+    throw error;
   }
-  return Array.from(set);
+}
+
+function hostOf(url?: string): string | undefined {
+  if (!url) return undefined;
+  try {
+    return new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+  } catch {
+    return undefined;
+  }
 }
 
 /**
  * Deeply enrich a company or Google Maps lead using LookaCrawler's token-optimized engine.
+ *
+ * The home page is fetched once: the same raw HTML feeds contact extraction
+ * (which needs <nav>/<footer>) and, on a cache miss, the markdown summary.
  */
 export async function deepEnrichLead(
   lead: Partial<GoogleMapsLead> & { title: string; web_site?: string },
-  options: {
-    mode?: "fast" | "deep";
-    crawlContactPages?: boolean;
-    linkFormat?: LinkFormat;
-    imageMode?: ImageMode;
-  } = {}
+  options: EnrichOptions = {}
 ): Promise<EnrichedLeadResult> {
   const mode = options.mode || "fast";
   const linkFormat = options.linkFormat || "references";
   const imageMode = options.imageMode || "alt_only";
+  const crawlContactPages = options.crawlContactPages !== false;
 
   const result: EnrichedLeadResult = {
     title: lead.title,
@@ -95,7 +100,9 @@ export async function deepEnrichLead(
     reviews: lead.review_count,
     latitude: lead.latitude,
     longitude: lead.longitude,
-    emails: lead.emails ? [...lead.emails] : [],
+    // Maps emails go through the same cleaning as site emails (lowercase,
+    // placeholders, asset names) so "Contato@X.com" and "contato@x.com" merge.
+    emails: cleanEmails(lead.emails || []),
     socialLinks: {},
     additionalPhones: [],
     decisionMakers: [],
@@ -103,6 +110,27 @@ export async function deepEnrichLead(
     estimatedTokens: 0,
     sourcePagesCrawled: [],
     enrichmentSuccess: false,
+    cnpjFromSite: [],
+  };
+
+  // The structured country from Maps decides how national numbers are read.
+  const region = countryToRegion(lead.complete_address?.country) || "BR";
+
+  // Phones are deduplicated by E.164, starting with the Maps listing phone.
+  const phoneKeys = new Set<string>();
+  const addPhone = (e164: string, formatted: string) => {
+    if (phoneKeys.has(e164)) return;
+    phoneKeys.add(e164);
+    result.additionalPhones.push(formatted);
+  };
+
+  if (lead.phone) {
+    const main = normalizePhone(lead.phone, { defaultRegion: region, context: "maps" });
+    if (main && main.valid) phoneKeys.add(main.e164);
+  }
+
+  const addEmails = (emails: Iterable<string>) => {
+    for (const em of cleanEmails(emails)) if (!result.emails.includes(em)) result.emails.push(em);
   };
 
   if (!lead.web_site || !lead.web_site.startsWith("http")) {
@@ -118,7 +146,8 @@ export async function deepEnrichLead(
   }
 
   try {
-    // 1. Crawl home page with cache
+    // 1. Fetch the home page once. The markdown cache only saves the
+    //    Readability/Turndown pass: contacts need the raw html either way.
     const cacheKey = buildCacheKey({
       url: lead.web_site,
       mode,
@@ -127,71 +156,64 @@ export async function deepEnrichLead(
     });
     let homeMarkdown = getCachedPage(cacheKey);
 
-    if (!homeMarkdown) {
-      if (mode === "deep") {
-        homeMarkdown = await extractDeep({
-          url: lead.web_site,
-          linkFormat,
-          imageMode,
-        });
-      } else {
-        homeMarkdown = await extractFast({
-          url: lead.web_site,
-          linkFormat,
-          imageMode,
-        });
+    // Raw html feeds contact extraction (and the markdown on a cache miss).
+    // On a deep-mode cache hit skip the browser: extractContacts fetches the
+    // home page itself with a plain request.
+    let rawHtml: string | undefined;
+    if (!homeMarkdown || mode === "fast") {
+      try {
+        rawHtml = await fetchHomeHtml(lead.web_site, mode);
+      } catch (fetchErr) {
+        // With cached markdown we can still summarize; without it there is nothing to enrich.
+        if (!homeMarkdown) throw fetchErr;
       }
-      setCachedPage(cacheKey, homeMarkdown, 86400 * 7); // Cache for 7 days
     }
+
+    if (!homeMarkdown && rawHtml !== undefined) {
+      homeMarkdown = processHtmlToMarkdown(rawHtml, { url: lead.web_site, linkFormat, imageMode });
+      setCachedPage(cacheKey, homeMarkdown);
+    }
+    homeMarkdown = homeMarkdown || "";
 
     result.sourcePagesCrawled.push(lead.web_site);
     result.enrichedFromUrl = lead.web_site;
 
-    // Contact extraction runs on the RAW html, not on `homeMarkdown`.
-    // The markdown pipeline strips <nav>/<footer> as boilerplate, which is
-    // exactly where most companies put the contact email and social links —
-    // reading them back from the pruned markdown returned emails: [] for
-    // sites that list them plainly in the footer. It also pruned the /contact
-    // link that step 5 searches for, so that fallback never fired either.
-    // extractContacts discovers contact subpages from the raw html, so it
-    // finds both; reuse it instead of keeping a second, weaker regex set.
+    // 2. Contacts from the RAW html, not from `homeMarkdown`: the markdown
+    //    pipeline strips <nav>/<footer> as boilerplate, which is exactly where
+    //    most companies put the contact email, phones, CNPJ and social links.
     let contacts: Awaited<ReturnType<typeof extractContacts>> | null = null;
     try {
       contacts = await extractContacts({
         url: lead.web_site,
-        deepScan: options.crawlContactPages !== false,
+        html: rawHtml,
+        deepScan: crawlContactPages,
+        defaultRegion: region,
       });
     } catch {
       /* contact extraction is best-effort; markdown fallbacks below still run */
     }
 
     if (contacts) {
-      for (const em of contacts.emails) {
-        if (!result.emails.includes(em)) result.emails.push(em);
-      }
+      addEmails(contacts.emails);
       const { instagram, linkedin, facebook, youtube, twitter } = contacts.socials;
       result.socialLinks.instagram = instagram;
       result.socialLinks.linkedin = linkedin;
       result.socialLinks.facebook = facebook;
       result.socialLinks.youtube = youtube;
       result.socialLinks.twitter = twitter;
-      for (const p of contacts.phones) {
-        if (!result.additionalPhones.includes(p) && p !== result.phone) {
-          result.additionalPhones.push(p);
-        }
+      for (const p of contacts.phoneDetails || []) addPhone(p.e164, p.formatted);
+      for (const page of contacts.contactPagesScanned) {
+        if (!result.sourcePagesCrawled.includes(page)) result.sourcePagesCrawled.push(page);
       }
-      for (const wa of contacts.whatsapps) {
-        if (!result.whatsapp) result.whatsapp = wa;
+      if (!result.whatsapp && contacts.whatsapps.length > 0) {
+        result.whatsapp = `https://wa.me/${contacts.whatsapps[0]}`;
       }
+      result.cnpjFromSite = contacts.cnpjs || [];
     }
 
     // 3. Markdown scan as a fallback for pages whose contact data survived
-    //    pruning (e.g. an address block inside <main>).
-    const foundEmails = homeMarkdown.match(EMAIL_REGEX) || [];
-    const cleaned = cleanEmails(foundEmails);
-    for (const em of cleaned) {
-      if (!result.emails.includes(em)) result.emails.push(em);
-    }
+    //    pruning, or when only the cached markdown is available.
+    addEmails(findEmails(homeMarkdown));
 
     // 4. Extract social links
     const socialMatches = homeMarkdown.match(/https?:\/\/(?:www\.)?(instagram|linkedin|facebook|youtube|twitter|x)\.com\/[a-zA-Z0-9._-]+/gi) || [];
@@ -210,42 +232,31 @@ export async function deepEnrichLead(
       }
     }
 
-    // 5. Extract possible additional phones
-    const foundPhones = homeMarkdown.match(INTL_PHONE_REGEX) || [];
-    for (const rawP of foundPhones) {
-      const clean = rawP.trim();
-      const digits = clean.replace(/[^0-9]/g, "");
-      if (digits.length >= 8 && digits.length <= 15) {
-        if (!result.additionalPhones.includes(clean) && clean !== result.phone) {
-          result.additionalPhones.push(clean);
-        }
-      }
+    // 5. Phones still in the markdown, deduplicated by E.164 against Maps and
+    //    the html scan. The phone module rejects CPF/CNPJ/CEP/ids.
+    for (const p of findPhones(homeMarkdown, { defaultRegion: region })) {
+      addPhone(p.e164, p.country === region ? p.national : p.international);
     }
 
-    // 5. If no emails found and crawlContactPages enabled, attempt to fetch dedicated contact page
-    if (options.crawlContactPages !== false && result.emails.length === 0) {
+    // 6. Contact page fallback, only when extractContacts could not run its
+    //    own subpage scan (it already visits /contato, /fale-conosco, ...).
+    if (crawlContactPages && !contacts && result.emails.length === 0) {
       const contactUrlMatch = homeMarkdown.match(/https?:\/\/[^\s\)\"\'\]]+(?:contact|contato|fale-conosco|about|quem-somos)[^\s\)\"\'\]]*/i);
-      if (contactUrlMatch && contactUrlMatch[0] !== lead.web_site) {
-        const contactUrl = contactUrlMatch[0];
+      const contactUrl = contactUrlMatch?.[0];
+      if (contactUrl && contactUrl !== lead.web_site && !result.sourcePagesCrawled.includes(contactUrl)) {
         try {
           await validateTargetUrl(contactUrl);
-          const contactMd = await extractFast({
-            url: contactUrl,
-            linkFormat,
-            imageMode,
-          });
+          const contactHtml = await fetchRawHtml(contactUrl, "fast", { maxRetries: 1 });
           result.sourcePagesCrawled.push(contactUrl);
-          const contactEmails = cleanEmails(contactMd.match(EMAIL_REGEX) || []);
-          for (const em of contactEmails) {
-            if (!result.emails.includes(em)) result.emails.push(em);
-          }
+          const contactMd = processHtmlToMarkdown(contactHtml, { url: contactUrl, linkFormat, imageMode });
+          addEmails(findEmails(contactMd));
         } catch {
           /* non-critical contact page crawl failure */
         }
       }
     }
 
-    // 6. Extract possible decision makers / doctors / owners
+    // 7. Extract possible decision makers / doctors / owners
     const personRegex = /(?:Dr\.|Dra\.|Diretor|Fundador|Sócio|CEO|Proprietário|Cirurgião|Owner|Founder|Director)[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})/g;
     let match;
     while ((match = personRegex.exec(homeMarkdown)) !== null) {
@@ -254,7 +265,7 @@ export async function deepEnrichLead(
       }
     }
 
-    // 7. Build ultra-compact LLM summary (< 300 tokens)
+    // 8. Build ultra-compact LLM summary (< 300 tokens)
     const summaryLines: string[] = [
       `### ${result.title}`,
       `- **Categoria/Nicho:** ${result.category || "Não informado"}`,
@@ -262,6 +273,9 @@ export async function deepEnrichLead(
       result.phone ? `- **Telefone Comercial:** ${result.phone}` : "",
       result.whatsapp ? `- **WhatsApp:** ${result.whatsapp}` : "",
       result.emails.length > 0 ? `- **E-mails Encontrados:** ${result.emails.join(", ")}` : "",
+      result.cnpjFromSite && result.cnpjFromSite.length > 0
+        ? `- **CNPJ (site):** ${result.cnpjFromSite.map(formatCnpj).join(", ")}`
+        : "",
       result.decisionMakers.length > 0 ? `- **Responsáveis/Corpo Técnico:** ${result.decisionMakers.join(", ")}` : "",
       result.socialLinks.instagram ? `- **Instagram:** ${result.socialLinks.instagram}` : "",
       result.socialLinks.linkedin ? `- **LinkedIn:** ${result.socialLinks.linkedin}` : "",

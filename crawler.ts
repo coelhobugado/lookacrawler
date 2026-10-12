@@ -58,6 +58,53 @@ export interface CrawlWebsiteResult {
   pages: CrawledPage[];
 }
 
+const MAX_URL_PATTERNS = 10;
+const MAX_URL_PATTERN_LENGTH = 200;
+
+/**
+ * Compile include/exclude filters. Patterns are case-sensitive substrings where
+ * `*` matches any run of characters; they are deliberately NOT regexes because
+ * crawled URLs are attacker-controlled and a backtracking regex like
+ * `^(([a-z/:.])+)+$` blocks the event loop for seconds (ReDoS).
+ */
+export function compileUrlPatterns(patterns: string[], kind: "include" | "exclude"): Array<(s: string) => boolean> {
+  if (patterns.length > MAX_URL_PATTERNS) throw new Error(`Too many ${kind} patterns (max ${MAX_URL_PATTERNS})`);
+  return patterns.map((p) => {
+    if (p.length > MAX_URL_PATTERN_LENGTH) throw new Error(`${kind} pattern is too long (max ${MAX_URL_PATTERN_LENGTH} characters)`);
+    // Fail loudly on old regex syntax: silently matching it literally would turn
+    // an exclude like "logout|admin" into a no-op. ("?" and "+" stay legal: URLs use them.)
+    if (/[\\^$()[\]{}|]|\.\*/.test(p)) {
+      throw new Error(`Invalid ${kind} pattern "${p}": patterns are substrings where * is the only wildcard, not regexes`);
+    }
+    const parts = p.split("*").filter(Boolean);
+    return (s: string) => {
+      let at = 0;
+      for (const part of parts) {
+        const i = s.indexOf(part, at);
+        if (i < 0) return false;
+        at = i + part.length;
+      }
+      return true;
+    };
+  });
+}
+
+function makeUrlFilter(host: string, includePatterns: string[], excludePatterns: string[]): (candidate: string) => boolean {
+  const include = compileUrlPatterns(includePatterns, "include");
+  const exclude = compileUrlPatterns(excludePatterns, "exclude");
+  return (candidate) => {
+    try {
+      const parsed = new URL(candidate);
+      if (parsed.hostname !== host) return false;
+      const hit = (m: (s: string) => boolean) => m(parsed.pathname) || m(candidate);
+      if (exclude.some(hit)) return false;
+      return include.length === 0 || include.some(hit);
+    } catch {
+      return false;
+    }
+  };
+}
+
 /**
  * Discover the architecture and page inventory of a website via sitemaps, robots.txt, and link graphs.
  */
@@ -71,21 +118,7 @@ export async function mapWebsite(options: MapWebsiteOptions): Promise<MapWebsite
   const sitemapsFound: string[] = [];
   const discoveredMap = new Map<string, DiscoveredUrl>();
 
-  const includeRegexes = includePatterns.map((p) => new RegExp(p));
-  const excludeRegexes = excludePatterns.map((p) => new RegExp(p));
-
-  function isUrlAllowed(candidate: string): boolean {
-    try {
-      const parsed = new URL(candidate);
-      if (parsed.hostname !== parsedStart.hostname) return false;
-      const path = parsed.pathname;
-      if (excludeRegexes.some((re) => re.test(path) || re.test(candidate))) return false;
-      if (includeRegexes.length > 0 && !includeRegexes.some((re) => re.test(path) || re.test(candidate))) return false;
-      return true;
-    } catch {
-      return false;
-    }
-  }
+  const isUrlAllowed = makeUrlFilter(parsedStart.hostname, includePatterns, excludePatterns);
 
   // 1. Inspect robots.txt for declared sitemaps
   try {
@@ -231,26 +264,7 @@ export async function crawlWebsite(options: CrawlWebsiteOptions): Promise<CrawlW
   await validateTargetUrl(startUrl);
   const targetHost = new URL(startUrl).hostname;
 
-  const includeRegexes = includePatterns.map((p) => new RegExp(p));
-  const excludeRegexes = excludePatterns.map((p) => new RegExp(p));
-
-  function isUrlAllowed(candidate: string): boolean {
-    try {
-      const parsed = new URL(candidate);
-      if (parsed.hostname !== targetHost) return false;
-      const path = parsed.pathname;
-
-      if (excludeRegexes.some((re) => re.test(path) || re.test(candidate))) {
-        return false;
-      }
-      if (includeRegexes.length > 0 && !includeRegexes.some((re) => re.test(path) || re.test(candidate))) {
-        return false;
-      }
-      return true;
-    } catch {
-      return false;
-    }
-  }
+  const isUrlAllowed = makeUrlFilter(targetHost, includePatterns, excludePatterns);
 
   const queue: Array<{ url: string; depth: number }> = [{ url: startUrl, depth: 0 }];
   const visited = new Set<string>([startUrl]);

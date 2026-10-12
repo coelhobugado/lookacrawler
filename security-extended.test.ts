@@ -121,3 +121,20 @@ describe("Security Module Extended (security.ts)", () => {
     });
   });
 });
+
+describe("isPrivateAddress: remaining special-purpose ranges", () => {
+  it("blocks documentation, Teredo, local NAT64, discard and IPv4-translated forms", () => {
+    for (const a of [
+      "192.0.2.1", "198.51.100.7", "203.0.113.9",
+      "2001:db8::1", "100::1", "64:ff9b:1::a00:1",
+      "::ffff:0:7f00:1", "::ffff:0:10.0.0.1",
+      "2001:0:4136:e378:8000:63bf:80ff:fffe", // Teredo client 127.0.0.1
+    ]) expect(isPrivateAddress(a)).toBe(true);
+  });
+
+  it("keeps public addresses reachable", () => {
+    for (const a of ["8.8.8.8", "203.0.114.1", "2001:4860:4860::8888", "2001:0:4136:e378:8000:63bf:f7f7:f7f7"]) {
+      expect(isPrivateAddress(a)).toBe(false);
+    }
+  });
+});

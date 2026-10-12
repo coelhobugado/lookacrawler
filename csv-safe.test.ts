@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { sanitizeCsvCell, sanitizeCsvRow, toSafeCsv } from "./csv-safe.js";
+import { EXCEL_PT_BR, sanitizeCsvCell, sanitizeCsvRow, toSafeCsv } from "./csv-safe.js";
 
 describe("CSV Safety & Formula Injection Prevention (csv-safe.ts)", () => {
   test("should prefix formula triggers (=, +, -, @, \\t, \\r) with an apostrophe", () => {
@@ -44,5 +44,24 @@ describe("CSV Safety & Formula Injection Prevention (csv-safe.ts)", () => {
     expect(csvOutput).toContain('"Empresa Alpha, S/A"');
     expect(csvOutput).toContain("'=calc");
     expect(csvOutput).toContain('"Quote ""Inside"""');
+  });
+});
+
+describe("CSV output for Excel pt-BR", () => {
+  test("defaults stay comma-delimited without BOM", () => {
+    const csv = toSafeCsv(["A", "B"], [["x;y", 1.5]]);
+    expect(csv.charCodeAt(0)).not.toBe(0xfeff);
+    expect(csv).toBe("A,B\r\nx;y,1.5");
+  });
+
+  test("semicolon delimiter quotes fields that contain it", () => {
+    const csv = toSafeCsv(["Nome", "Endereço"], [["Clínica; Centro", "Rua A, 10"]], { delimiter: ";" });
+    expect(csv).toBe('Nome;Endereço\r\n"Clínica; Centro";Rua A, 10');
+  });
+
+  test("Excel preset adds BOM, semicolons and decimal commas while keeping formula protection", () => {
+    const csv = toSafeCsv(["Título", "Lat", "Nota"], [["=HYPERLINK(1)", -16.6869, "4.5"]], EXCEL_PT_BR);
+    expect(csv.charCodeAt(0)).toBe(0xfeff);
+    expect(csv.slice(1)).toBe("Título;Lat;Nota\r\n'=HYPERLINK(1);-16,6869;4.5");
   });
 });

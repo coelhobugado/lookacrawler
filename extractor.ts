@@ -24,6 +24,9 @@ function hasEntries(obj?: Record<string, any>): boolean {
 export type LinkFormat = "inline" | "references" | "strip";
 export type ImageMode = "ignore" | "alt_only" | "markdown";
 
+const MAX_ACTIONS = 20;
+const ACTIONS_TOTAL_MS = 30_000;
+
 export type PageAction =
   | { type: "click"; selector: string; timeoutMs?: number }
   | { type: "scroll"; direction?: "up" | "down"; pixels?: number }
@@ -96,6 +99,28 @@ function stripCredentialHeaders(
   return next;
 }
 
+/**
+ * Decode an HTML body with its declared charset (TextDecoder() alone assumes
+ * UTF-8 and garbles ISO-8859-1 / windows-1252 pages, common on Brazilian
+ * sites). Order: BOM, Content-Type charset, <meta> in the first 2 KB, UTF-8.
+ */
+export function decodeHtml(body: Uint8Array, contentType: string | null): string {
+  const decode = (label: string) => {
+    try {
+      return new TextDecoder(label).decode(body);
+    } catch {
+      return new TextDecoder().decode(body); // unknown label
+    }
+  };
+  if (body[0] === 0xef && body[1] === 0xbb && body[2] === 0xbf) return decode("utf-8");
+  if (body[0] === 0xff && body[1] === 0xfe) return decode("utf-16le");
+  if (body[0] === 0xfe && body[1] === 0xff) return decode("utf-16be");
+  const fromHeader = contentType?.match(/charset\s*=\s*["']?([^;"'\s]+)/i)?.[1];
+  if (fromHeader) return decode(fromHeader);
+  const head = new TextDecoder("windows-1252").decode(body.subarray(0, 2048));
+  return decode(head.match(/<meta[^>]+charset\s*=\s*["']?\s*([a-z0-9_:.-]+)/i)?.[1] || "utf-8");
+}
+
 /** Read a response body as text, aborting as soon as it grows past `maxBytes`. */
 async function readBodyWithLimit(response: Response, maxBytes: number): Promise<string> {
   if (!response.body) return "";
@@ -112,7 +137,7 @@ async function readBodyWithLimit(response: Response, maxBytes: number): Promise<
     }
     chunks.push(value);
   }
-  return new TextDecoder().decode(Buffer.concat(chunks));
+  return decodeHtml(Buffer.concat(chunks), response.headers.get("content-type"));
 }
 
 /** Validate a caller-supplied proxy, or fall back to the operator's proxy pool. */
@@ -652,6 +677,8 @@ async function extractDeepOnce(options: DeepExtractOptions): Promise<string> {
           const browser = await getBrowser(proxyPool.getProxy(proxy));
 
           context = await browser.newContext({
+            // A service worker could fetch on the page's behalf outside the request guard.
+            serviceWorkers: "block",
             // Mirrors LOOKACRAWLER_INSECURE_TLS: needed only behind a
             // TLS-intercepting proxy, never by default.
             ...(process.env.LOOKACRAWLER_INSECURE_TLS === "true" ? { ignoreHTTPSErrors: true } : {}),
@@ -695,21 +722,27 @@ async function extractDeepOnce(options: DeepExtractOptions): Promise<string> {
 
           // Execute pre-crawl automation actions if defined (e.g. cookie consent, load more, scrolling)
           if (actions && actions.length > 0) {
-            for (const act of actions) {
+            // Bounded so one request cannot hold a browser context indefinitely
+            // (the MCP schema enforces the same caps; this covers library callers).
+            const deadline = Date.now() + ACTIONS_TOTAL_MS;
+            for (const act of actions.slice(0, MAX_ACTIONS)) {
+              const left = deadline - Date.now();
+              if (left <= 0) break;
+              const stepMs = Math.min(3000, left);
               try {
                 if (act.type === "click" && act.selector) {
-                  await page.waitForSelector(act.selector, { timeout: act.timeoutMs || 3000 }).catch(() => {});
-                  await page.click(act.selector).catch(() => {});
+                  await page.waitForSelector(act.selector, { timeout: Math.min(act.timeoutMs || 3000, stepMs) }).catch(() => {});
+                  await page.click(act.selector, { timeout: stepMs }).catch(() => {});
                 } else if (act.type === "scroll") {
-                  const px = act.pixels ?? 800;
+                  const px = Math.min(Math.max(act.pixels ?? 800, 0), 20000);
                   const dy = act.direction === "up" ? -px : px;
                   await page.evaluate((y) => window.scrollBy({ top: y, behavior: "smooth" }), dy);
-                  await page.waitForTimeout(400);
+                  await page.waitForTimeout(Math.min(400, left));
                 } else if (act.type === "wait" && act.milliseconds) {
-                  await page.waitForTimeout(act.milliseconds);
+                  await page.waitForTimeout(Math.min(act.milliseconds, 10000, left));
                 } else if (act.type === "fill" && act.selector) {
-                  await page.waitForSelector(act.selector, { timeout: 3000 }).catch(() => {});
-                  await page.fill(act.selector, act.value || "").catch(() => {});
+                  await page.waitForSelector(act.selector, { timeout: stepMs }).catch(() => {});
+                  await page.fill(act.selector, act.value || "", { timeout: stepMs }).catch(() => {});
                 }
               } catch {
                 /* non-critical action failure */
@@ -916,6 +949,8 @@ export async function fetchRawHtml(
           await globalRateLimiter.throttle(url);
           const browser = await getBrowser(proxyPool.getProxy(proxy));
           context = await browser.newContext({
+            // A service worker could fetch on the page's behalf outside the request guard.
+            serviceWorkers: "block",
             // Mirrors LOOKACRAWLER_INSECURE_TLS: needed only behind a
             // TLS-intercepting proxy, never by default.
             ...(process.env.LOOKACRAWLER_INSECURE_TLS === "true" ? { ignoreHTTPSErrors: true } : {}),

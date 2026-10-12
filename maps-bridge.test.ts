@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { resolveMapsLeadsBinary, discoverLocalLeads, formatWhatsAppLink } from "./maps-bridge.js";
+import { resolveMapsLeadsBinary, discoverLocalLeads, formatWhatsAppLink, describeWhatsApp } from "./maps-bridge.js";
 import { deepEnrichLead } from "./enrichment-bridge.js";
 
 describe("Maps bridge binary resolution", () => {
@@ -83,5 +83,32 @@ describe("Deep lead enrichment guards", () => {
     const result = await deepEnrichLead({ title: "Local", web_site: "http://127.0.0.1:8080" });
     expect(result.enrichmentSuccess).toBe(false);
     expect(result.error).toContain("security policy");
+  });
+});
+describe("WhatsApp link details", () => {
+  test("the structured country beats address-text heuristics", () => {
+    // "London" in a Brazilian street name must not turn this into a UK number.
+    expect(formatWhatsAppLink("(11) 98765-4321", "Rua London, 10 - São Paulo", "BR")).toBe(
+      "https://wa.me/5511987654321"
+    );
+    expect(formatWhatsAppLink("020 7946 0958", "221B Baker St", "GB")).toBe("https://wa.me/442079460958");
+    expect(formatWhatsAppLink("(415) 555-0100", "1 Market St", "United States")).toBe("https://wa.me/14155550100");
+  });
+
+  test("keeps links for landlines but reports the line type", () => {
+    const fixed = describeWhatsApp("(62) 3333-4444", undefined, "Brazil");
+    expect(fixed?.link).toBe("https://wa.me/556233334444");
+    expect(fixed?.type).toBe("fixed");
+
+    const mobile = describeWhatsApp("(62) 99999-9999");
+    expect(mobile?.type).toBe("mobile");
+    expect(mobile?.e164).toBe("+5562999999999");
+  });
+
+  test("refuses document numbers and unknown area codes", () => {
+    expect(formatWhatsAppLink("123.456.789-09")).toBeUndefined();
+    expect(formatWhatsAppLink("(20) 99876-5432")).toBeUndefined();
+    // Bare international digits still work without a "+".
+    expect(formatWhatsAppLink("447356026050")).toBe("https://wa.me/447356026050");
   });
 });

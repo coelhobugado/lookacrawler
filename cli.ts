@@ -2,7 +2,7 @@
 import { formatJinaReader } from "./jina-format.js";
 
 import { readFile, writeFile } from "fs/promises";
-import { toSafeCsv } from "./csv-safe.js";
+import { EXCEL_PT_BR, toSafeCsv } from "./csv-safe.js";
 
 const VERSION = "1.1.2";
 
@@ -58,12 +58,13 @@ Options for 'enrich-batch':
 Options for 'places':
   --limit <n>                 Maximum places to return (default: 5).
   --csv                       Output as formula-injection-safe CSV instead of JSON.
+  --excel                     CSV for Excel pt-BR (BOM, ";" delimiter, decimal comma). Implies --csv.
   --output, -o <file>         Write output to a file.
 
 Options for 'map':
   --max-urls <n>              Maximum discovered URLs to return (default: 1000).
-  --include <pattern>         Regex filter: only URLs matching pattern.
-  --exclude <pattern>         Regex filter: ignore URLs matching pattern.
+  --include <pattern>         Only URLs containing pattern (* = wildcard).
+  --exclude <pattern>         Ignore URLs containing pattern (* = wildcard).
   --output, -o <file>         Write JSON output to a file.
 
 Options for 'crawl':
@@ -73,8 +74,8 @@ Options for 'crawl':
   --link-format <fmt>         Link format: inline, references, or strip (default: inline)
   --image-mode <mode>         Image mode: markdown, alt_only, or ignore (default: markdown)
   --concurrency <n>           Parallel page crawl concurrency limit (default: 3).
-  --include <pattern>         Regex filter for allowed URLs.
-  --exclude <pattern>         Regex filter for forbidden URLs.
+  --include <pattern>         Allowed URL pattern (substring, * = wildcard).
+  --exclude <pattern>         Forbidden URL pattern (substring, * = wildcard).
   --output, -o <file>         Write JSON output to a file.
 
 Options for 'batch':
@@ -224,7 +225,8 @@ async function runCli() {
     }
     const query = positionalUrls.join(" ");
     const limit = getOption(args, "--limit") ? parseInt(getOption(args, "--limit")!, 10) : 5;
-    const isCsv = args.includes("--csv");
+    const isExcel = args.includes("--excel");
+    const isCsv = isExcel || args.includes("--csv");
     const outputFile = getOption(args, "--output") || getOption(args, "-o");
 
     try {
@@ -236,7 +238,7 @@ async function runCli() {
           p.title, p.address ?? "", p.phone ?? "", p.website ?? "",
           p.rating ?? "", p.reviewCount ?? "", p.latitude ?? "", p.longitude ?? "", p.url ?? "",
         ]);
-        outputText = toSafeCsv(headers, rows);
+        outputText = toSafeCsv(headers, rows, isExcel ? EXCEL_PT_BR : {});
       } else {
         outputText = JSON.stringify(result, null, 2);
       }

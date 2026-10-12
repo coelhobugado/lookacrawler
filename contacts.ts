@@ -1,6 +1,12 @@
 import { JSDOM } from "jsdom";
+import type { CountryCode } from "libphonenumber-js";
 import { fetchHtml } from "./extractor.js";
 import { validateTargetUrl } from "./security.js";
+import { normalizePhone, findPhones, type NormalizedPhone, type PhoneType } from "./quality/phone.js";
+import { cleanEmail, findEmails } from "./quality/email.js";
+import { extractCnpjs } from "./quality/cnpj.js";
+
+const WHATSAPP_URL_REGEX = /(?<![\w.])(?:wa\.me\/|api\.whatsapp\.com\/send\/?\?(?:[^"'\s<>]*?&(?:amp;)?)?phone=|whatsapp:\/\/send\/?\?phone=)(?:%2B|\+)?(\d[\d-]{8,18}\d)/gi;
 
 export interface SocialProfiles {
   instagram?: string;
@@ -12,13 +18,32 @@ export interface SocialProfiles {
   tiktok?: string;
 }
 
+export interface ContactPhone {
+  e164: string;
+  /** National format for numbers in the default region, international otherwise. */
+  formatted: string;
+  type: PhoneType;
+  valid: boolean;
+  /** "tel" for tel: links, "text" for numbers found in visible text. */
+  origin: "tel" | "text";
+  /** The same number also appears in a WhatsApp link on the site. */
+  whatsapp?: boolean;
+  /** First page the number was seen on. */
+  url: string;
+}
+
 export interface ExtractedContacts {
   url: string;
   emails: string[];
+  /** Formatted phones, deduplicated by E.164. */
   phones: string[];
   whatsapps: string[];
   socials: SocialProfiles;
   contactPagesScanned: string[];
+  /** Normalized phones with type and origin, same order as `phones`. */
+  phoneDetails?: ContactPhone[];
+  /** DV-valid CNPJs printed on the site (unmasked), numeric or alphanumeric. */
+  cnpjs?: string[];
 }
 
 export interface ExtractContactsOptions {
@@ -28,86 +53,130 @@ export interface ExtractContactsOptions {
   headers?: Record<string, string>;
   cookies?: Record<string, string>;
   proxy?: string;
+  /** Already-fetched HTML of `url`; skips the root fetch when provided. */
+  html?: string;
+  /** Region used to read numbers without a country code. Defaults to "BR". */
+  defaultRegion?: CountryCode;
+  /** Contact subpages to visit when deepScan is on. Defaults to 3. */
+  maxSubpages?: number;
 }
 
-// Bounded local part and domain labels keep the scan linear: an unbounded
-// `[...]+@` restarts at every position of a long token with no "@"
-// (inline JSON, base64, hashes) and takes seconds on ~100 KB of text.
-const EMAIL_REGEX = /(?<![\w.%+-])[\w.%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})*\.[A-Za-z]{2,24}\b/g;
+/**
+ * Everything found on one page. `contactLinks` are same-host subpages worth
+ * visiting, best first.
+ */
+export interface PageContacts {
+  emails: string[];
+  phones: ContactPhone[];
+  whatsapps: string[];
+  socials: SocialProfiles;
+  cnpjs: string[];
+  contactLinks: string[];
+}
 
-// Known dummy / placeholder email prefixes & domains
-const IGNORED_EMAIL_PATTERNS = [
-  /^user@/i,
-  /^example@/i,
-  /^test@/i,
-  /^teste@/i,
-  /^email@/i,
-  /^contato@dominio\.com/i,
-  /@example\.com$/i,
-  /@domain\.com$/i,
-  /@site\.com$/i,
-  /@sentry\.io$/i,
-  /@wixpress\.com$/i,
-  /@cloudflare\.com$/i,
-];
-
-// File extensions mistakenly captured as email domain ends
-const INVALID_EMAIL_EXTENSIONS = new Set([
-  "png", "jpg", "jpeg", "webp", "avif", "gif", "bmp", "svg", "css", "js", "woff", "woff2", "ttf", "ico"
-]);
-
-const PHONE_REGEX = /(?:\+?(\d{1,3}))?[-.\s]?(?:\(?(\d{2,3})\)?)?[-.\s]?(\d{4,5})[-.\s]?(\d{4})\b/g;
+export interface ParseContactsOptions {
+  /** URL of the page being parsed, when it differs from the site root. */
+  pageUrl?: string;
+  defaultRegion?: CountryCode;
+}
 
 /**
  * Extract contact information, social links, and communication endpoints from a target website.
  */
 export async function extractContacts(options: ExtractContactsOptions): Promise<ExtractedContacts> {
-  const { url, deepScan = true, timeoutMs = 12000, headers, cookies, proxy } = options;
+  const {
+    url,
+    deepScan = true,
+    timeoutMs = 12000,
+    headers,
+    cookies,
+    proxy,
+    html,
+    defaultRegion = "BR",
+    maxSubpages = 3,
+  } = options;
   await validateTargetUrl(url);
 
   const parsedRoot = new URL(url);
-  const emailsSet = new Set<string>();
-  const phonesSet = new Set<string>();
-  const whatsappsSet = new Set<string>();
-  const socials: SocialProfiles = {};
-  const scannedPages: string[] = [url];
+  const merged = new ContactMerger(url);
 
   // 1. Fetch & scan root HTML
   try {
-    const rootHtml = await fetchHtml(url, { timeoutMs, headers, cookies, proxy });
-    parseContactsFromHtml(rootHtml, parsedRoot, emailsSet, phonesSet, whatsappsSet, socials);
+    const rootHtml = html ?? (await fetchHtml(url, { timeoutMs, headers, cookies, proxy }));
+    const root = parseContactsFromHtml(rootHtml, parsedRoot, { defaultRegion });
+    merged.add(root);
 
-    // 2. Discover and scan dedicated contact subpages if deepScan is enabled
+    // 2. Visit the best-ranked contact subpages if deepScan is enabled
     if (deepScan) {
-      const contactUrls = discoverContactSubpages(rootHtml, parsedRoot);
-      const subpagesToVisit = contactUrls.slice(0, 3); // Max 3 subpages
-
-      await Promise.all(
+      const subpagesToVisit = root.contactLinks.slice(0, maxSubpages);
+      const pages = await Promise.all(
         subpagesToVisit.map(async (subUrl) => {
           try {
             await validateTargetUrl(subUrl);
             const subHtml = await fetchHtml(subUrl, { timeoutMs: 8000, headers, cookies, proxy });
-            scannedPages.push(subUrl);
-            parseContactsFromHtml(subHtml, parsedRoot, emailsSet, phonesSet, whatsappsSet, socials);
+            return { subUrl, found: parseContactsFromHtml(subHtml, parsedRoot, { pageUrl: subUrl, defaultRegion }) };
           } catch {
-            /* ignore subpage failure */
+            return null; /* ignore subpage failure */
           }
         })
       );
+      // Merge in ranking order so the result does not depend on response timing.
+      for (const page of pages) {
+        if (!page) continue;
+        merged.scanned.push(page.subUrl);
+        merged.add(page.found);
+      }
     }
   } catch (err: any) {
     // If root fails, rethrow
     throw new Error(`Failed to extract contacts from ${url}: ${err.message || String(err)}`);
   }
 
-  return {
-    url,
-    emails: Array.from(emailsSet).sort(),
-    phones: Array.from(phonesSet).sort(),
-    whatsapps: Array.from(whatsappsSet).sort(),
-    socials,
-    contactPagesScanned: scannedPages,
-  };
+  return merged.result();
+}
+
+class ContactMerger {
+  readonly scanned: string[];
+  private emails = new Set<string>();
+  private phones = new Map<string, ContactPhone>();
+  private whatsapps = new Set<string>();
+  private cnpjs = new Set<string>();
+  private socials: SocialProfiles = {};
+
+  constructor(private url: string) {
+    this.scanned = [url];
+  }
+
+  add(page: PageContacts): void {
+    for (const e of page.emails) this.emails.add(e);
+    for (const p of page.phones) {
+      const existing = this.phones.get(p.e164);
+      // A tel: link is stronger evidence than a number read from text.
+      if (!existing || (existing.origin === "text" && p.origin === "tel")) this.phones.set(p.e164, p);
+    }
+    for (const w of page.whatsapps) this.whatsapps.add(w);
+    for (const c of page.cnpjs) this.cnpjs.add(c);
+    for (const [k, v] of Object.entries(page.socials) as [keyof SocialProfiles, string][]) {
+      if (v && !this.socials[k]) this.socials[k] = v;
+    }
+  }
+
+  result(): ExtractedContacts {
+    const details = Array.from(this.phones.values()).sort((a, b) => a.formatted.localeCompare(b.formatted));
+    for (const d of details) {
+      if (this.whatsapps.has(d.e164.slice(1))) d.whatsapp = true;
+    }
+    return {
+      url: this.url,
+      emails: Array.from(this.emails).sort(),
+      phones: details.map((d) => d.formatted),
+      whatsapps: Array.from(this.whatsapps).sort(),
+      socials: this.socials,
+      contactPagesScanned: this.scanned,
+      phoneDetails: details,
+      cnpjs: Array.from(this.cnpjs),
+    };
+  }
 }
 
 /**
@@ -131,91 +200,123 @@ export function decodeCloudflareEmail(hex: string): string | null {
 }
 
 /**
- * Parses emails, phone numbers, WhatsApps, and social links from an HTML document string.
+ * Parse contacts from an HTML string. Builds one JSDOM; prefer
+ * parseContactsFromDocument when the caller already has a document.
  */
-function parseContactsFromHtml(
-  html: string,
-  rootUrl: URL,
-  emails: Set<string>,
-  phones: Set<string>,
-  whatsapps: Set<string>,
-  socials: SocialProfiles
-): void {
-  const dom = new JSDOM(html, { url: rootUrl.toString() });
-  const doc = dom.window.document;
+export function parseContactsFromHtml(html: string, rootUrl: URL | string, options: ParseContactsOptions = {}): PageContacts {
+  const dom = new JSDOM(html, { url: options.pageUrl || rootUrl.toString() });
+  return parseContactsFromDocument(dom.window.document, rootUrl, options);
+}
+
+/**
+ * Parse emails, phone numbers, WhatsApps, social links, CNPJs and contact
+ * subpage links from a ready DOM in a single pass. The document is not
+ * modified, so the caller can keep using it.
+ */
+export function parseContactsFromDocument(
+  doc: Document,
+  rootUrl: URL | string,
+  options: ParseContactsOptions = {}
+): PageContacts {
+  const root = typeof rootUrl === "string" ? new URL(rootUrl) : rootUrl;
+  const pageUrl = options.pageUrl || root.toString();
+  const defaultRegion = options.defaultRegion || "BR";
+
+  const emails = new Set<string>();
+  const phones = new Map<string, ContactPhone>();
+  const whatsapps = new Set<string>();
+  const socials: SocialProfiles = {};
+
+  const addPhone = (parsed: NormalizedPhone | null, origin: "tel" | "text") => {
+    if (!parsed || phones.has(parsed.e164)) return;
+    phones.set(parsed.e164, {
+      e164: parsed.e164,
+      formatted: parsed.country === defaultRegion ? parsed.national : parsed.international,
+      type: parsed.type,
+      valid: parsed.valid,
+      origin,
+      url: pageUrl,
+    });
+  };
 
   // 0. Cloudflare email protection — decode before anything else, since the
   //    address is never present as plaintext anywhere in the document.
   for (const el of Array.from(doc.querySelectorAll('a[href*="/cdn-cgi/l/email-protection"]'))) {
     const hash = (el.getAttribute("href") || "").split("#")[1];
     if (!hash) continue;
-    const decoded = decodeCloudflareEmail(hash);
-    if (decoded && isValidEmail(decoded.toLowerCase())) {
-      emails.add(decoded.toLowerCase());
-    }
+    const decoded = cleanEmail(decodeCloudflareEmail(hash));
+    if (decoded) emails.add(decoded);
   }
 
-  // 1. Extract mailto: links
-  for (const a of Array.from(doc.querySelectorAll('a[href^="mailto:"]'))) {
-    const raw = a.getAttribute("href") || "";
-    const mail = safeDecode(raw.replace(/^mailto:/i, "").split("?")[0]).trim().toLowerCase();
-    if (isValidEmail(mail)) {
-      emails.add(mail);
-    }
+  // 1. mailto: links
+  for (const a of Array.from(doc.querySelectorAll('a[href^="mailto:" i]'))) {
+    const mail = cleanEmail(a.getAttribute("href"));
+    if (mail) emails.add(mail);
   }
 
-  // 2. Extract tel: links
-  for (const a of Array.from(doc.querySelectorAll('a[href^="tel:"]'))) {
-    const raw = a.getAttribute("href") || "";
-    const cleanPhone = raw.replace(/^tel:/i, "").trim();
-    if (cleanPhone.length >= 8) {
-      phones.add(cleanPhone);
-    }
+  // 2. tel: links. The site owner marked these as phones explicitly, so a
+  //    number that is possible but fails strict validation is still kept.
+  for (const a of Array.from(doc.querySelectorAll('a[href^="tel:" i]'))) {
+    addPhone(normalizePhone(a.getAttribute("href"), { defaultRegion, context: "tel" }), "tel");
   }
 
-  // 3. Extract WhatsApp links
-  for (const a of Array.from(doc.querySelectorAll("a[href]"))) {
+  // 3. WhatsApp, social and contact-subpage links in one walk over anchors
+  const ranked: { url: string; rank: number; order: number }[] = [];
+  const seenLinks = new Set<string>();
+  const anchors = Array.from(doc.querySelectorAll("a[href]"));
+  anchors.forEach((a, order) => {
     const href = (a.getAttribute("href") || "").trim();
     if (
       href.includes("wa.me/") ||
       href.includes("api.whatsapp.com/send") ||
       href.startsWith("whatsapp:")
     ) {
-      const parsedNumber = extractWhatsAppNumber(href);
-      if (parsedNumber) {
-        whatsapps.add(parsedNumber);
-      }
+      const parsedNumber = extractWhatsAppNumber(href, defaultRegion);
+      if (parsedNumber) whatsapps.add(parsedNumber);
     }
 
-    // Social Media Links
     detectSocialLink(href, socials);
-  }
 
-  // 4. Text regex scan for emails and phone numbers
-  const bodyText = visibleText(doc);
-
-  // Scan emails in text
-  const emailMatches = bodyText.match(EMAIL_REGEX) || [];
-  for (const email of emailMatches) {
-    const lower = email.toLowerCase();
-    if (isValidEmail(lower)) {
-      emails.add(lower);
-    }
-  }
-
-  // Scan phones in text
-  const phoneMatches = bodyText.match(PHONE_REGEX) || [];
-  for (const phone of phoneMatches) {
-    const cleaned = phone.trim();
-    // Validate minimum digits to eliminate dates or small integers
-    const digitsOnly = cleaned.replace(/\D/g, "");
-    if (digitsOnly.length >= 8 && digitsOnly.length <= 15) {
-      // Exclude common date patterns like 2026 or year stamps
-      if (!cleaned.match(/^(19|20)\d{2}$/)) {
-        phones.add(cleaned);
+    const rank = contactLinkRank(href, a.textContent || "", root);
+    if (rank !== null) {
+      try {
+        const resolved = new URL(href, pageUrl);
+        resolved.hash = "";
+        resolved.search = "";
+        const key = resolved.toString();
+        if (!seenLinks.has(key)) {
+          seenLinks.add(key);
+          ranked.push({ url: key, rank, order });
+        }
+      } catch {
+        /* skip invalid link */
       }
     }
+  });
+
+  // 3b. WhatsApp links outside anchors: chat widgets keep them in <script>,
+  //     escaped JSON (`https:\/\/`) or data-* attributes, which is how most
+  //     Brazilian sites expose the number.
+  for (const m of doc.documentElement.outerHTML.replace(/\\\//g, "/").matchAll(WHATSAPP_URL_REGEX)) {
+    const digits = m[1].replace(/\D/g, "");
+    if (digits.length >= 10 && digits.length <= 15) whatsapps.add(digits);
   }
+
+  // 4. Visible text scan for emails (incl. "[at]" spellings), phones and CNPJs
+  const bodyText = visibleText(doc);
+  for (const email of findEmails(bodyText)) emails.add(email);
+  for (const phone of findPhones(bodyText, { defaultRegion })) addPhone(phone, "text");
+  const cnpjs = extractCnpjs(bodyText);
+
+  ranked.sort((a, b) => a.rank - b.rank || a.order - b.order);
+  return {
+    emails: Array.from(emails),
+    phones: Array.from(phones.values()),
+    whatsapps: Array.from(whatsapps),
+    socials,
+    cnpjs,
+    contactLinks: ranked.map((r) => r.url),
+  };
 }
 
 /**
@@ -226,64 +327,31 @@ function parseContactsFromHtml(
  */
 function visibleText(doc: Document): string {
   if (!doc.body) return "";
-  for (const el of Array.from(doc.body.querySelectorAll("script, style, noscript, template"))) {
-    el.remove();
-  }
   const walker = doc.createTreeWalker(doc.body, 4 /* NodeFilter.SHOW_TEXT */);
   const parts: string[] = [];
   for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-    if (node.nodeValue) parts.push(node.nodeValue);
+    if (!node.nodeValue) continue;
+    const parent = node.parentElement;
+    if (parent && parent.closest("script, style, noscript, template")) continue;
+    parts.push(node.nodeValue);
   }
   return parts.join(" ");
 }
 
-function safeDecode(value: string): string {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
-}
-
 /**
- * Filter out invalid, dummy, or static-file false positive emails.
+ * Normalizes WhatsApp phone number from links like wa.me/5511999999999 or
+ * api.whatsapp.com, as international digits without "+".
  */
-function isValidEmail(email: string): boolean {
-  if (!email || email.length < 6 || email.length > 100) return false;
-  if (!email.includes("@") || !email.includes(".")) return false;
-
-  // Check extension after last dot
-  const lastDot = email.lastIndexOf(".");
-  const ext = email.slice(lastDot + 1).toLowerCase();
-  if (INVALID_EMAIL_EXTENSIONS.has(ext)) return false;
-
-  for (const pattern of IGNORED_EMAIL_PATTERNS) {
-    if (pattern.test(email)) return false;
+function extractWhatsAppNumber(urlStr: string, defaultRegion: CountryCode): string | null {
+  let digits: string | undefined;
+  if (urlStr.includes("wa.me/")) {
+    digits = urlStr.split("wa.me/")[1]?.split(/[?#/]/)[0]?.replace(/\D/g, "");
+  } else {
+    digits = urlStr.match(/phone=([0-9+%]+)/)?.[1]?.replace(/%2B/gi, "").replace(/\D/g, "");
   }
-
-  return true;
-}
-
-/**
- * Normalizes WhatsApp phone number from links like wa.me/5511999999999 or api.whatsapp.com.
- */
-function extractWhatsAppNumber(urlStr: string): string | null {
-  try {
-    if (urlStr.includes("wa.me/")) {
-      const segment = urlStr.split("wa.me/")[1]?.split("?")[0]?.replace(/\D/g, "");
-      return segment && segment.length >= 8 ? segment : null;
-    }
-    if (urlStr.includes("phone=")) {
-      const match = urlStr.match(/phone=([0-9+]+)/);
-      if (match && match[1]) {
-        const clean = match[1].replace(/\D/g, "");
-        return clean.length >= 8 ? clean : null;
-      }
-    }
-  } catch {
-    /* ignore parse error */
-  }
-  return null;
+  if (!digits || digits.length < 8) return null;
+  const parsed = normalizePhone(digits, { defaultRegion, context: "whatsapp" });
+  return parsed?.valid ? parsed.e164.slice(1) : digits;
 }
 
 /**
@@ -343,55 +411,72 @@ function cleanUrl(raw: string): string {
   }
 }
 
+// Contact subpage keywords by priority (lower is better). Multi-word entries
+// use "-" and are matched as whole words against path segments and link text.
+const CONTACT_KEYWORDS: [string, number][] = [
+  ["contato", 0], ["contatos", 0], ["contact", 0], ["contacts", 0], ["contact-us", 0], ["contactus", 0],
+  ["fale-conosco", 0], ["faleconosco", 0], ["atendimento", 0],
+  ["sobre", 1], ["sobre-nos", 1], ["about", 1], ["about-us", 1], ["quem-somos", 1], ["quemsomos", 1],
+  ["a-empresa", 1], ["institucional", 1],
+  ["equipe", 2], ["nossa-equipe", 2], ["team", 2], ["our-team", 2], ["corpo-clinico", 2],
+  ["trabalhe-conosco", 3],
+];
+
+const NON_PAGE_EXTENSIONS = /\.(?:pdf|jpe?g|png|gif|webp|svg|zip|rar|docx?|xlsx?|mp4|mp3)$/i;
+
+/** Lowercase, strip accents and turn every non-alphanumeric run into "-". */
+function wordKey(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-");
+}
+
+function keywordRank(key: string): number | null {
+  const padded = `-${key}-`;
+  let best: number | null = null;
+  for (const [kw, rank] of CONTACT_KEYWORDS) {
+    if ((best === null || rank < best) && padded.includes(`-${kw}-`)) best = rank;
+  }
+  return best;
+}
+
 /**
- * Discovers dedicated contact/about subpages on the same host.
+ * Priority of a link as a contact subpage, or null when it is not one.
+ * Matches whole path segments or whole words in the link text, never
+ * substrings ("team" must not match "steam", "sobre" not "Sobremesas").
  */
-function discoverContactSubpages(html: string, rootUrl: URL): string[] {
-  const dom = new JSDOM(html, { url: rootUrl.toString() });
-  const anchors = Array.from(dom.window.document.querySelectorAll("a[href]"));
-  const contactKeywords = [
-    "contato",
-    "contact",
-    "fale-conosco",
-    "faleconosco",
-    "sobre",
-    "about",
-    "quem-somos",
-    "equipe",
-    "team",
-    "trabalhe-conosco",
-  ];
+function contactLinkRank(href: string, text: string, root: URL): number | null {
+  if (!href || href.startsWith("#") || /^(?:mailto|tel|javascript|whatsapp):/i.test(href)) return null;
+  let resolved: URL;
+  try {
+    resolved = new URL(href, root);
+  } catch {
+    return null;
+  }
+  if (resolved.hostname !== root.hostname) return null;
+  if (resolved.protocol !== "http:" && resolved.protocol !== "https:") return null;
+  const path = resolved.pathname.replace(/\/+$/, "");
+  if (path === root.pathname.replace(/\/+$/, "") || NON_PAGE_EXTENSIONS.test(path)) return null;
 
-  const foundUrls = new Set<string>();
-
-  for (const a of anchors) {
-    const href = a.getAttribute("href")?.trim();
-    if (!href) continue;
-
-    const text = (a.textContent || "").toLowerCase().trim();
-    const hrefLower = href.toLowerCase();
-
-    const matchesKeyword = contactKeywords.some(
-      (kw) => hrefLower.includes(kw) || text.includes(kw)
-    );
-
-    if (matchesKeyword) {
-      try {
-        const resolved = new URL(href, rootUrl);
-        if (
-          resolved.hostname === rootUrl.hostname &&
-          (resolved.protocol === "http:" || resolved.protocol === "https:") &&
-          resolved.pathname !== rootUrl.pathname
-        ) {
-          resolved.hash = "";
-          resolved.search = "";
-          foundUrls.add(resolved.toString());
-        }
-      } catch {
-        /* skip invalid link */
-      }
+  let best: number | null = null;
+  for (const segment of path.split("/")) {
+    if (!segment) continue;
+    let decoded = segment;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch {
+      /* keep raw */
     }
+    const rank = keywordRank(wordKey(decoded.replace(/\.(?:html?|php|aspx?)$/i, "")));
+    if (rank !== null && (best === null || rank < best)) best = rank;
   }
 
-  return Array.from(foundUrls);
+  const label = text.trim();
+  if (label && label.length <= 60) {
+    const rank = keywordRank(wordKey(label));
+    if (rank !== null && (best === null || rank < best)) best = rank;
+  }
+  return best;
 }

@@ -103,13 +103,26 @@ interface LaunchProxy {
  * real Chrome is not installed, we fall back to the bundled Chromium so the tool
  * still works out of the box.
  */
+/**
+ * Chromium's --proxy-server ignores user:pass in the URL (auth fails with 407)
+ * and would expose it on the process command line; Playwright takes them apart.
+ */
+export function toPlaywrightProxy(proxy: string): LaunchProxy {
+  const u = new URL(proxy);
+  return {
+    server: `${u.protocol}//${u.host}`,
+    ...(u.username ? { username: decodeURIComponent(u.username) } : {}),
+    ...(u.password ? { password: decodeURIComponent(u.password) } : {}),
+  };
+}
+
 export async function getBrowser(proxy?: string): Promise<Browser> {
   let key: string;
   let launchProxy: LaunchProxy | undefined;
   if (proxy && proxy.trim()) {
     const validated = await validateProxyUrl(proxy);
     key = `proxy:${validated}`;
-    launchProxy = { server: validated };
+    launchProxy = toPlaywrightProxy(validated);
   } else if (isLocalAccessAllowed()) {
     key = "direct";
   } else {

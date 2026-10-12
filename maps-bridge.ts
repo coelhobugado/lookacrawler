@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import type { CountryCode } from "libphonenumber-js";
+import { countryToRegion, normalizePhone, type NormalizedPhone, type PhoneType } from "./quality/phone.js";
 
 export interface GoogleMapsLead {
   input_id?: string;
@@ -36,6 +38,10 @@ export interface GoogleMapsLead {
   };
   featured_image?: string;
   whatsapp_link?: string;
+  /** Normalized listing phone, when it validates. */
+  phone_e164?: string;
+  /** Line type of the listing phone; a "fixed" whatsapp_link deserves less trust. */
+  phone_type?: PhoneType;
   emails?: string[];
 }
 
@@ -96,72 +102,89 @@ export function resolveMapsLeadsBinary(customPath?: string): string | null {
   return null;
 }
 
+export interface WhatsAppLinkInfo {
+  link: string;
+  e164: string;
+  /**
+   * Line type of the number. Fixed lines still get a link — plenty of
+   * Brazilian businesses run WhatsApp Business on a landline — but callers
+   * should trust a "fixed" link less than a "mobile" one.
+   */
+  type: PhoneType;
+  valid: boolean;
+}
+
 /**
- * Format international E.164 WhatsApp link based on phone format and location context.
+ * Region for a listing: the structured `complete_address.country` wins; the
+ * address text is only a fallback for records without it.
  */
-export function formatWhatsAppLink(phone?: string, address?: string, country?: string): string | undefined {
+function resolveListingRegion(address?: string, country?: string): CountryCode | undefined {
+  const structured = countryToRegion(country);
+  if (structured) return structured;
+
+  const loc = `${address || ""} ${country || ""}`.toLowerCase();
+  // Whole-word matches only: a substring test for "us" or "uk" also hits
+  // Brazilian addresses such as "Rua Augusta" or "Setor Industrial".
+  if (/\b(uk|united kingdom|bristol|london|manchester|liverpool|birmingham|leeds|sheffield|cardiff|southampton)\b/.test(loc)) {
+    return "GB";
+  }
+  if (/\b(us|usa|united states)\b/.test(loc)) return "US";
+  return undefined;
+}
+
+/**
+ * Parse a listing phone into a wa.me link plus its E.164 form and line type.
+ */
+export function describeWhatsApp(phone?: string, address?: string, country?: string): WhatsAppLinkInfo | undefined {
   if (!phone) return undefined;
   const raw = phone.trim();
   const digits = raw.replace(/[^0-9]/g, "");
   if (digits.length < 8) return undefined;
 
-  // Case 1: Phone already has explicit '+' international indicator
+  const toInfo = (parsed: NormalizedPhone): WhatsAppLinkInfo => ({
+    link: `https://wa.me/${parsed.e164.slice(1)}`,
+    e164: parsed.e164,
+    type: parsed.type,
+    valid: parsed.valid,
+  });
+
+  // Case 1: explicit international number. Trust the source even when the
+  // metadata does not know the range yet.
   if (raw.startsWith("+")) {
-    return `https://wa.me/${digits}`;
+    const parsed = normalizePhone(raw, { context: "maps" });
+    if (parsed && parsed.valid) return toInfo(parsed);
+    return { link: `https://wa.me/${digits}`, e164: `+${digits}`, type: "unknown", valid: false };
   }
 
-  const loc = `${address || ""} ${country || ""}`.toLowerCase();
+  const region = resolveListingRegion(address, country) || "BR";
 
-  // Whole-word matches only: a substring test for "us" or "uk" also hits
-  // Brazilian addresses such as "Rua Augusta" or "Setor Industrial".
-  // Case 2: UK numbers
-  const isUK =
-    /\b(uk|united kingdom|bristol|london|manchester|liverpool|birmingham|leeds|sheffield|cardiff|southampton)\b/.test(loc);
-
-  if (isUK) {
-    if (digits.startsWith("44") && digits.length >= 11) {
-      return `https://wa.me/${digits}`;
-    }
-    if (digits.startsWith("0")) {
-      return `https://wa.me/44${digits.slice(1)}`;
-    }
-    return `https://wa.me/44${digits}`;
-  }
-
-  // Case 3: US / Canada (10 digits or 1 + 10 digits)
-  const isUS = /\b(us|usa|united states)\b/.test(loc);
-  if (isUS) {
-    if (digits.startsWith("1") && digits.length === 11) {
-      return `https://wa.me/${digits}`;
-    }
-    if (digits.length === 10) {
-      return `https://wa.me/1${digits}`;
-    }
-  }
-
-  // No E.164 number starts with 0, so a leading zero means this is a national
-  // long-distance form (0 + carrier code, e.g. "(011) 99123-4567"). The area
-  // code is not in the string and no case below can recover it, so guessing
-  // yields a wa.me link that dials nothing. Refuse before any BR formatting
-  // tries to pad it into a valid-looking 11 digits.
-  if (digits.startsWith("0")) {
+  // No E.164 number starts with 0, so in Brazil a leading zero means a
+  // national long-distance form (0 + carrier code, e.g. "(011) 99123-4567").
+  // The area code is ambiguous there, and guessing yields a wa.me link that
+  // dials nothing. Refuse instead.
+  if (region === "BR" && digits.startsWith("0")) {
     return undefined;
   }
 
-  // Case 4: Brazil (DDD + 8 or 9 digits)
-  if (digits.startsWith("55") && (digits.length === 12 || digits.length === 13)) {
-    return `https://wa.me/${digits}`;
-  }
-  if (digits.length === 10 || digits.length === 11) {
-    return `https://wa.me/55${digits}`;
-  }
+  const parsed = normalizePhone(raw, { defaultRegion: region, context: "maps" });
+  if (parsed && parsed.valid) return toInfo(parsed);
 
-  // Fallback: If 11 or more digits, use as international digits
-  if (digits.length >= 11) {
-    return `https://wa.me/${digits}`;
+  // Already-international digits without "+" (e.g. "447356026050"). Masked
+  // strings are national by construction (and may be CPF/CNPJ), so skip them.
+  if (digits.length >= 11 && /^[\d\s]+$/.test(raw)) {
+    const intl = normalizePhone(`+${digits}`, { context: "maps" });
+    if (intl && intl.valid) return toInfo(intl);
   }
 
   return undefined;
+}
+
+/**
+ * Format international E.164 WhatsApp link based on phone format and location context.
+ * Use describeWhatsApp to also get the line type (mobile vs fixed).
+ */
+export function formatWhatsAppLink(phone?: string, address?: string, country?: string): string | undefined {
+  return describeWhatsApp(phone, address, country)?.link;
 }
 
 /**
@@ -211,10 +234,8 @@ function parseDaemonRowToLead(row: string[], headerIndex: Map<string, number>): 
   const phone = sanitizeNumber(get("phone")) || undefined;
   const rawCountry = parseJson<{ country?: string }>(get("complete_address"), {}).country;
 
-  let whatsappLink: string | undefined = undefined;
-  if (phone) {
-    whatsappLink = formatWhatsAppLink(phone, address, rawCountry);
-  }
+  const phoneInfo = phone ? describeWhatsApp(phone, address, rawCountry) : undefined;
+  const whatsappLink = phoneInfo?.link;
 
   const rawLat = parseFloat(sanitizeNumber(get("latitude")));
   const rawLon = parseFloat(sanitizeNumber(get("longitude")));
@@ -256,6 +277,8 @@ function parseDaemonRowToLead(row: string[], headerIndex: Map<string, number>): 
     owner: parseJson(get("owner"), undefined),
     featured_image: get("thumbnail") || undefined,
     whatsapp_link: whatsappLink,
+    phone_e164: phoneInfo?.valid ? phoneInfo.e164 : undefined,
+    phone_type: phoneInfo?.type,
     emails: emails && emails.length > 0 ? emails : undefined,
   };
 
@@ -580,12 +603,11 @@ export async function discoverLocalLeadsViaCli(
           }
         }
 
-        if (!whatsappLink && parsed.phone) {
-          whatsappLink = formatWhatsAppLink(
-            parsed.phone,
-            parsed.address,
-            parsed.complete_address?.country
-          );
+        const phoneInfo = parsed.phone
+          ? describeWhatsApp(parsed.phone, parsed.address, parsed.complete_address?.country)
+          : undefined;
+        if (!whatsappLink) {
+          whatsappLink = phoneInfo?.link;
         }
 
         const lead: GoogleMapsLead = {
@@ -611,6 +633,8 @@ export async function discoverLocalLeadsViaCli(
           owner: parsed.owner,
           featured_image: parsed.featured_image,
           whatsapp_link: whatsappLink,
+          phone_e164: phoneInfo?.valid ? phoneInfo.e164 : undefined,
+          phone_type: phoneInfo?.type,
           emails: parsed.emails || undefined,
         };
 

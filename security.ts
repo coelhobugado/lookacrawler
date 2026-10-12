@@ -23,6 +23,9 @@ function isPrivateIPv4(address: string): boolean {
     (octets[0] === 192 && octets[1] === 0 && octets[2] === 0) || // IETF protocol assignments (RFC 6890)
     (octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127) || // Carrier-Grade NAT (RFC 6598)
     (octets[0] === 198 && (octets[1] === 18 || octets[1] === 19)) || // Benchmark network (RFC 2544)
+    (octets[0] === 192 && octets[1] === 0 && octets[2] === 2) || // TEST-NET-1 (RFC 5737)
+    (octets[0] === 198 && octets[1] === 51 && octets[2] === 100) || // TEST-NET-2
+    (octets[0] === 203 && octets[1] === 0 && octets[2] === 113) || // TEST-NET-3
     octets[0] >= 224 // Multicast & reserved
   );
 }
@@ -66,6 +69,8 @@ export function isPrivateAddress(address: string): boolean {
   const firstFiveZero = g.slice(0, 5).every((x) => x === 0);
   // ::ffff:a.b.c.d (IPv4-mapped, also written ::ffff:7f00:1 after URL normalisation)
   if (firstFiveZero && g[5] === 0xffff) return isPrivateIPv4(embeddedIPv4(g, 6, 7));
+  // ::ffff:0:a.b.c.d (IPv4-translated, RFC 2765)
+  if (g.slice(0, 4).every((x) => x === 0) && g[4] === 0xffff && g[5] === 0) return isPrivateIPv4(embeddedIPv4(g, 6, 7));
   // ::a.b.c.d (deprecated IPv4-compatible), including :: and ::1
   if (firstFiveZero && g[5] === 0) {
     if (g[6] === 0 && (g[7] === 0 || g[7] === 1)) return true;
@@ -75,13 +80,19 @@ export function isPrivateAddress(address: string): boolean {
   if (g[0] === 0x64 && g[1] === 0xff9b && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0) {
     return isPrivateIPv4(embeddedIPv4(g, 6, 7));
   }
+  // 64:ff9b:1::/48 local-use NAT64 (RFC 8215): the IPv4 can sit anywhere, fail closed
+  if (g[0] === 0x64 && g[1] === 0xff9b && g[2] === 1) return true;
+  // 2001:0::/32 Teredo: the client IPv4 is stored XOR 0xffff in groups 6-7
+  if (g[0] === 0x2001 && g[1] === 0) return isPrivateIPv4(embeddedIPv4([...g.slice(0, 6), g[6] ^ 0xffff, g[7] ^ 0xffff], 6, 7));
   // 2002::/16 6to4 embeds the IPv4 address in groups 1-2
   if (g[0] === 0x2002) return isPrivateIPv4(embeddedIPv4(g, 1, 2));
   return (
     (g[0] & 0xfe00) === 0xfc00 || // fc00::/7 unique local
     (g[0] & 0xffc0) === 0xfe80 || // fe80::/10 link-local
     (g[0] & 0xffc0) === 0xfec0 || // fec0::/10 site-local (deprecated)
-    (g[0] & 0xff00) === 0xff00 // multicast
+    (g[0] & 0xff00) === 0xff00 || // multicast
+    (g[0] === 0x2001 && g[1] === 0xdb8) || // 2001:db8::/32 documentation
+    (g[0] === 0x100 && g[1] === 0 && g[2] === 0 && g[3] === 0) // 100::/64 discard
   );
 }
 
