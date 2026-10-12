@@ -48,6 +48,16 @@ const NOT_A_PHONE = [
   /^(?:19|20)\d{2}\s?[-–]\s?(?:19|20)\d{2}$/, // 2019-2026
 ];
 
+function isValidCpf(d: string): boolean {
+  if (/^(\d)\1{10}$/.test(d)) return false;
+  for (const n of [9, 10]) {
+    let sum = 0;
+    for (let i = 0; i < n; i++) sum += Number(d[i]) * (n + 1 - i);
+    if (((sum * 10) % 11) % 10 !== Number(d[n])) return false;
+  }
+  return true;
+}
+
 /**
  * Normalize a raw phone string into E.164 plus national/international
  * formatting and a mobile/fixed classification.
@@ -87,6 +97,12 @@ export function normalizePhone(raw: string | null | undefined, options: Normaliz
     const intl = digits.length === 13 && digits.startsWith("55") && digits[4] === "9";
     if (!mobile11 && !intl) return null;
   }
+
+  // A bare 11-digit run with valid CPF check digits is a CPF, not a mobile
+  // ("11945678941" would otherwise read as DDD 11 + 9-digit mobile). Explicit
+  // tel:/wa.me links are trusted. ~1% of real unformatted mobiles also pass the
+  // check digits and are dropped; formatted ones are unaffected.
+  if (bare && digits.length === 11 && (context === "text" || context === "maps") && isValidCpf(digits)) return null;
 
   // wa.me / api.whatsapp.com carry the number without "+".
   if (!hasPlus && (context === "whatsapp" || (bare && digits.length >= 12 && digits.startsWith("55")))) {

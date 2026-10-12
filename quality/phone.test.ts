@@ -39,6 +39,16 @@ describe("Phone normalization (quality/phone.ts)", () => {
     expect(normalizePhone("123")).toBeNull();
   });
 
+  test("rejects a bare 11-digit CPF that looks like a mobile, keeps formatted numbers", () => {
+    // Valid CPF check digits, DDD 11 and a 9 in third position.
+    expect(normalizePhone("11945678941")).toBeNull();
+    expect(normalizePhone("11945678941", { context: "maps" })).toBeNull();
+    expect(normalizePhone("(11) 94567-8941")?.e164).toBe("+5511945678941");
+    expect(normalizePhone("tel:11945678941", { context: "tel" })?.e164).toBe("+5511945678941");
+    // Same shape without valid CPF check digits stays a mobile.
+    expect(normalizePhone("11945678900")?.e164).toBe("+5511945678900");
+  });
+
   test("bare digits are accepted from explicit links", () => {
     expect(normalizePhone("5511988887777", { context: "whatsapp" })?.e164).toBe("+5511988887777");
     expect(normalizePhone("1133334444", { context: "tel" })?.type).toBe("fixed");
