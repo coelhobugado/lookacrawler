@@ -141,7 +141,7 @@ export async function deepEnrichLead(
           imageMode,
         });
       }
-      setCachedPage(cacheKey, homeMarkdown, 86400 * 7); // Cache for 7 days
+      setCachedPage(cacheKey, homeMarkdown);
     }
 
     result.sourcePagesCrawled.push(lead.web_site);
