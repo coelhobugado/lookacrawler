@@ -1,5 +1,5 @@
 import { describe, it, expect, afterAll } from "bun:test";
-import { getBrowser, closeBrowsers, getStealthInit } from "./browser-manager.js";
+import { getBrowser, closeBrowsers, getStealthInit, toPlaywrightProxy } from "./browser-manager.js";
 
 describe("Browser Manager Module (browser-manager.ts)", () => {
   afterAll(async () => {
@@ -33,5 +33,16 @@ describe("Browser Manager Module (browser-manager.ts)", () => {
 
   it("should close browsers cleanly without throwing", async () => {
     await expect(closeBrowsers()).resolves.toBeUndefined();
+  });
+});
+
+describe("toPlaywrightProxy", () => {
+  it("moves credentials out of the server URL", () => {
+    expect(toPlaywrightProxy("http://us%40r:p%3Ass@proxy.example.com:8080")).toEqual({
+      server: "http://proxy.example.com:8080",
+      username: "us@r",
+      password: "p:ss",
+    });
+    expect(toPlaywrightProxy("socks5://proxy.example.com:1080")).toEqual({ server: "socks5://proxy.example.com:1080" });
   });
 });

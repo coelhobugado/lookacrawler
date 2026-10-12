@@ -677,6 +677,8 @@ async function extractDeepOnce(options: DeepExtractOptions): Promise<string> {
           const browser = await getBrowser(proxyPool.getProxy(proxy));
 
           context = await browser.newContext({
+            // A service worker could fetch on the page's behalf outside the request guard.
+            serviceWorkers: "block",
             // Mirrors LOOKACRAWLER_INSECURE_TLS: needed only behind a
             // TLS-intercepting proxy, never by default.
             ...(process.env.LOOKACRAWLER_INSECURE_TLS === "true" ? { ignoreHTTPSErrors: true } : {}),
@@ -947,6 +949,8 @@ export async function fetchRawHtml(
           await globalRateLimiter.throttle(url);
           const browser = await getBrowser(proxyPool.getProxy(proxy));
           context = await browser.newContext({
+            // A service worker could fetch on the page's behalf outside the request guard.
+            serviceWorkers: "block",
             // Mirrors LOOKACRAWLER_INSECURE_TLS: needed only behind a
             // TLS-intercepting proxy, never by default.
             ...(process.env.LOOKACRAWLER_INSECURE_TLS === "true" ? { ignoreHTTPSErrors: true } : {}),
