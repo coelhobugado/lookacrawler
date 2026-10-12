@@ -67,6 +67,22 @@ describe("Contact & Social Extraction Module (contacts.ts)", () => {
           );
         }
 
+        if (url.pathname === "/chat-widget") {
+          // Brazilian sites mostly ship WhatsApp through chat widgets, not anchors.
+          return new Response(
+            `<!DOCTYPE html>
+            <html>
+              <body>
+                <p>Fale com a gente</p>
+                <script>var chat = { link: "https://wa.me/551133334444?text=Ol%C3%A1" };</script>
+                <script type="application/json">{"url":"https:\\/\\/api.whatsapp.com\\/send?phone=%2B5562991234567"}</script>
+                <div data-href="whatsapp://send?phone=5562988887777"></div>
+              </body>
+            </html>`,
+            { headers: { "Content-Type": "text/html; charset=utf-8" } }
+          );
+        }
+
         return new Response("Not Found", { status: 404 });
       },
     });
@@ -99,6 +115,14 @@ describe("Contact & Social Extraction Module (contacts.ts)", () => {
 
     expect(result.whatsapps).toContain("5511988887777");
     expect(result.phones.some((p) => p.includes("98765-4321"))).toBe(true);
+  });
+
+  test("should extract WhatsApp numbers from scripts, escaped JSON and data attributes", async () => {
+    const result = await extractContacts({ url: `${serverUrl}/chat-widget`, deepScan: false });
+
+    expect(result.whatsapps).toContain("551133334444");
+    expect(result.whatsapps).toContain("5562991234567");
+    expect(result.whatsapps).toContain("5562988887777");
   });
 
   test("should extract social profiles without tracking query parameters", async () => {
