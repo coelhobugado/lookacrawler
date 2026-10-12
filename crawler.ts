@@ -71,6 +71,11 @@ export function compileUrlPatterns(patterns: string[], kind: "include" | "exclud
   if (patterns.length > MAX_URL_PATTERNS) throw new Error(`Too many ${kind} patterns (max ${MAX_URL_PATTERNS})`);
   return patterns.map((p) => {
     if (p.length > MAX_URL_PATTERN_LENGTH) throw new Error(`${kind} pattern is too long (max ${MAX_URL_PATTERN_LENGTH} characters)`);
+    // Fail loudly on old regex syntax: silently matching it literally would turn
+    // an exclude like "logout|admin" into a no-op. ("?" and "+" stay legal: URLs use them.)
+    if (/[\\^$()[\]{}|]|\.\*/.test(p)) {
+      throw new Error(`Invalid ${kind} pattern "${p}": patterns are substrings where * is the only wildcard, not regexes`);
+    }
     const parts = p.split("*").filter(Boolean);
     return (s: string) => {
       let at = 0;

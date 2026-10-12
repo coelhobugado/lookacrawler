@@ -15,10 +15,17 @@ describe("compileUrlPatterns", () => {
     expect(() => compileUrlPatterns(["a".repeat(201)], "exclude")).toThrow("max 200");
   });
 
-  it("treats regex syntax literally, so catastrophic patterns stay linear", () => {
-    const [m] = compileUrlPatterns(["^(([a-z/:.])+)+$"], "exclude");
+  it("rejects regex syntax instead of silently matching it literally", () => {
+    for (const p of ["^(([a-z/:.])+)+$", "logout|admin", "\\.pdf$", "/docs/.*", "[0-9]+"]) {
+      expect(() => compileUrlPatterns([p], "exclude")).toThrow("not regexes");
+    }
+    expect(compileUrlPatterns(["/search?q=", "/a+b/", "*.pdf"], "exclude")).toHaveLength(3);
+  });
+
+  it("stays linear on long hostile URLs", () => {
+    const [m] = compileUrlPatterns(["/a*a*a*a*a*b"], "exclude");
     const start = performance.now();
-    expect(m("https://" + "a".repeat(100_000) + "!")).toBe(false);
+    expect(m("/" + "a".repeat(100_000))).toBe(false);
     expect(performance.now() - start).toBeLessThan(50);
   });
 });
