@@ -420,7 +420,7 @@ Returns a list of URLs with source and modification metadata. Useful for explori
   server.registerTool(
     "crawl_website",
     {
-      description: `Recursively crawl an entire website or documentation section with depth limits, route regex filtering, and token accounting.`,
+      description: `Recursively crawl an entire website or documentation section with depth limits, URL pattern filtering, and token accounting.`,
       inputSchema: {
         start_url: z.string().url().describe("Root URL to start the recursive crawl from."),
         max_depth: z.number().int().min(1).max(5).default(2).optional().describe("Maximum link traversal depth (default: 2)."),

@@ -29,7 +29,7 @@ Web crawling for Large Language Models (LLMs) is broken by default: modern web p
 | :--- | :---: | :---: | :---: |
 | **Pricing / Cost** | **$0.00 (100% Free Open Source)** | $16 to $99+/month | Rate-limited API |
 | **Token Reduction** | **Median 90% fewer tokens (real pages) + Footnotes** | Standard Markdown | Basic Markdown |
-| **Autonomous Crawling** | **Native `map` & `crawl` (BFS + Regex)** | Cloud Crawler | Single-page only |
+| **Autonomous Crawling** | **Native `map` & `crawl` (BFS + URL patterns)** | Cloud Crawler | Single-page only |
 | **Pre-Crawl Actions** | **Native Playwright (click, scroll, fill)** | Paid Addon | None |
 | **Link Formatting** | **Inline, References Footnotes, Strip** | Inline only | Inline only |
 | **Data Privacy** | **100% Local (Zero Telemetry)** | Cloud Provider | Cloud API |
@@ -48,7 +48,7 @@ Web crawling for Large Language Models (LLMs) is broken by default: modern web p
   - `image_mode`: Choose between `ignore` (zero tokens), `alt_only` (preserves semantic context without URL bloat), or `markdown` (full `![alt](url)`).
 - **Autonomous Mapping & Recursive Crawling:**
   - `map_website`: Inspects `/robots.txt`, sitemaps, and root anchors to discover all pages in a domain.
-  - `crawl_website`: Breadth-first autonomous crawling with max depth, max pages, route regex filters, and real-time token accounting.
+  - `crawl_website`: Breadth-first autonomous crawling with max depth, max pages, URL pattern filters (substring, `*` wildcard), and real-time token accounting.
 - **Pre-Crawl Browser Actions:** Automate clicks, scrolls, typing, and waits in Playwright before extracting content (dismiss cookie banners, scroll for infinite loading, expand accordions).
 - **Dual Hybrid Crawling Engine:**
   - `fast`: Ultra-fast native HTTP GET with backoff. Auto-escalates to `deep` if an anti-bot challenge is encountered.
@@ -114,8 +114,8 @@ bun run cli.ts extract https://example.com --mode deep --selector "main" --json
 # Discover all website URLs and sitemaps
 bun run cli.ts map https://example.com --max-urls 500
 
-# Recursively crawl documentation with regex filtering and token accounting
-bun run cli.ts crawl https://example.com/docs --max-depth 2 --max-pages 15 --link-format references
+# Recursively crawl documentation with URL pattern filtering and token accounting
+bun run cli.ts crawl https://example.com/docs --max-depth 2 --max-pages 15 --include /docs/ --link-format references
 
 # Batch concurrent multi-URL crawling
 bun run cli.ts batch https://site1.com https://site2.com --concurrency 4
