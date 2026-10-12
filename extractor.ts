@@ -99,6 +99,28 @@ function stripCredentialHeaders(
   return next;
 }
 
+/**
+ * Decode an HTML body with its declared charset (TextDecoder() alone assumes
+ * UTF-8 and garbles ISO-8859-1 / windows-1252 pages, common on Brazilian
+ * sites). Order: BOM, Content-Type charset, <meta> in the first 2 KB, UTF-8.
+ */
+export function decodeHtml(body: Uint8Array, contentType: string | null): string {
+  const decode = (label: string) => {
+    try {
+      return new TextDecoder(label).decode(body);
+    } catch {
+      return new TextDecoder().decode(body); // unknown label
+    }
+  };
+  if (body[0] === 0xef && body[1] === 0xbb && body[2] === 0xbf) return decode("utf-8");
+  if (body[0] === 0xff && body[1] === 0xfe) return decode("utf-16le");
+  if (body[0] === 0xfe && body[1] === 0xff) return decode("utf-16be");
+  const fromHeader = contentType?.match(/charset\s*=\s*["']?([^;"'\s]+)/i)?.[1];
+  if (fromHeader) return decode(fromHeader);
+  const head = new TextDecoder("windows-1252").decode(body.subarray(0, 2048));
+  return decode(head.match(/<meta[^>]+charset\s*=\s*["']?\s*([a-z0-9_:.-]+)/i)?.[1] || "utf-8");
+}
+
 /** Read a response body as text, aborting as soon as it grows past `maxBytes`. */
 async function readBodyWithLimit(response: Response, maxBytes: number): Promise<string> {
   if (!response.body) return "";
@@ -115,7 +137,7 @@ async function readBodyWithLimit(response: Response, maxBytes: number): Promise<
     }
     chunks.push(value);
   }
-  return new TextDecoder().decode(Buffer.concat(chunks));
+  return decodeHtml(Buffer.concat(chunks), response.headers.get("content-type"));
 }
 
 /** Validate a caller-supplied proxy, or fall back to the operator's proxy pool. */
