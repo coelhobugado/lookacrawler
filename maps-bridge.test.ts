@@ -112,3 +112,65 @@ describe("WhatsApp link details", () => {
     expect(formatWhatsAppLink("447356026050")).toBe("https://wa.me/447356026050");
   });
 });
+
+describe("Maps CLI completion", () => {
+  // A stand-in for maps-leads that behaves like the real one on a short result
+  // page: it prints its leads, then a child (the browser) keeps stdout open and
+  // the process never exits on its own.
+  const fakeBinary = (dir: string, lines: object[]) => {
+    const path = `${dir}/fake-maps-leads`;
+    const out = lines.map((l) => JSON.stringify(l)).join("\n");
+    Bun.write(path, `#!/bin/sh\nprintf '%s\\n' '${out.replace(/'/g, "'\\''")}'\nsleep 600 &\necho $! > "${dir}/grandchild.pid"\nwait\n`);
+    require("node:fs").chmodSync(path, 0o755);
+    return path;
+  };
+
+  test("finishes on inactivity even when the scraper hangs, and kills its whole process group", async () => {
+    const dir = require("node:fs").mkdtempSync(`${require("node:os").tmpdir()}/maps-fake-`);
+    const bin = fakeBinary(dir, [
+      { title: "Loja A", phone: "+55 62 99999-0001", cid: "1", place_id: "ChIJ_test_A", link_sources: [{ link: "https://api.whatsapp.com/send?phone=5562999990001", source: "x" }] },
+      { title: "Loja B", phone: "+55 62 3000-1000", cid: "2" },
+    ]);
+    const started = Date.now();
+    const res = await discoverLocalLeads("lojas", { customBinaryPath: bin, preferDaemon: false, limit: 20, idleMs: 400, timeoutMs: 20000 });
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(res.success).toBe(true);
+    expect(res.data.map((l) => l.title)).toEqual(["Loja A", "Loja B"]);
+    // Declared on the Google listing vs built from the listing phone.
+    expect(res.data[0].whatsapp_source).toBe("google");
+    expect(res.data[1].whatsapp_source).toBe("phone");
+    expect(res.data[1].phone_type).toBe("fixed");
+    expect(res.data[0].place_id).toBe("ChIJ_test_A");
+    await Bun.sleep(200);
+    const pid = Number(require("node:fs").readFileSync(`${dir}/grandchild.pid`, "utf8"));
+    expect(() => process.kill(pid, 0)).toThrow(); // the "browser" is gone too
+  });
+
+  test("scrolls one page by default: -depth 2+ kills the scraper's browser", async () => {
+    const dir = require("node:fs").mkdtempSync(`${require("node:os").tmpdir()}/maps-fake-`);
+    const path = `${dir}/echo-args`;
+    // Prints its own argv as the lead title, then exits.
+    Bun.write(path, `#!/bin/sh\nprintf '{"title":"%s","cid":"1"}\\n' "$*"\n`);
+    require("node:fs").chmodSync(path, 0o755);
+    const res = await discoverLocalLeads("lojas", { customBinaryPath: path, preferDaemon: false, limit: 20, idleMs: 300 });
+    expect(res.data[0].title).toContain("-depth 1 ");
+  });
+
+  test("an empty run that logged scraper errors is a failure, not an empty success", async () => {
+    const dir = require("node:fs").mkdtempSync(`${require("node:os").tmpdir()}/maps-fake-`);
+    const path = `${dir}/crashing`;
+    Bun.write(path, `#!/bin/sh\necho '{"level":"error","error":"playwright: target closed","message":"error while processing job"}' >&2\nexit 0\n`);
+    require("node:fs").chmodSync(path, 0o755);
+    const res = await discoverLocalLeads("lojas", { customBinaryPath: path, preferDaemon: false });
+    expect(res.success).toBe(false);
+    expect(res.error).toContain("target closed");
+  });
+
+  test("a timeout returns what arrived instead of hanging", async () => {
+    const dir = require("node:fs").mkdtempSync(`${require("node:os").tmpdir()}/maps-fake-`);
+    const bin = fakeBinary(dir, [{ title: "Loja C", cid: "3" }]);
+    const res = await discoverLocalLeads("lojas", { customBinaryPath: bin, preferDaemon: false, idleMs: 60000, timeoutMs: 800 });
+    expect(res.data.map((l) => l.title)).toEqual(["Loja C"]);
+    expect(res.success).toBe(true);
+  });
+});

@@ -8,6 +8,8 @@ export interface GoogleMapsLead {
   input_id?: string;
   link?: string;
   cid?: string;
+  /** Google's stable place id; the safest dedupe key across queries. */
+  place_id?: string;
   title: string;
   category?: string;
   categories?: string[];
@@ -42,6 +44,12 @@ export interface GoogleMapsLead {
   phone_e164?: string;
   /** Line type of the listing phone; a "fixed" whatsapp_link deserves less trust. */
   phone_type?: PhoneType;
+  /**
+   * Where `whatsapp_link` came from: "google" when the business itself listed a
+   * WhatsApp link on its Maps profile, "phone" when it was built from the
+   * listing phone (unconfirmed: the number may not be on WhatsApp).
+   */
+  whatsapp_source?: "google" | "phone";
   emails?: string[];
 }
 
@@ -53,6 +61,12 @@ export interface MapsScrapeOptions {
   lang?: string;
   fastMode?: boolean;
   timeoutMs?: number;
+  /**
+   * CLI mode: finish once this long passes without a new lead (after the first
+   * one). maps-leads often keeps running after its last result, so waiting for
+   * it to exit can take forever. Default 15000.
+   */
+  idleMs?: number;
   geo?: string;
   radius?: number;
   extractEmails?: boolean;
@@ -301,7 +315,11 @@ export async function discoverLocalLeadsViaDaemon(
     : query.trim();
 
   const limit = options.limit || 20;
-  const depth = options.depth || Math.max(1, Math.min(10, Math.ceil(limit / 10)));
+  // One scroll page. Measured 2026-10-12 on the bundled maps-leads: the same
+  // query returns 18 leads at -depth 1 and 0 at -depth 2 (the browser dies
+  // with "playwright: target closed" during the second scroll). A page holds
+  // ~20 results, so more leads need more queries, not more depth.
+  const depth = options.depth || 1;
   const lang = options.lang || "pt-BR";
   const timeoutMs = options.timeoutMs || 90000;
 
@@ -476,10 +494,15 @@ export async function discoverLocalLeadsViaCli(
     : query.trim();
 
   const limit = options.limit || 20;
-  const depth = options.depth || Math.max(1, Math.min(10, Math.ceil(limit / 10)));
+  // One scroll page. Measured 2026-10-12 on the bundled maps-leads: the same
+  // query returns 18 leads at -depth 1 and 0 at -depth 2 (the browser dies
+  // with "playwright: target closed" during the second scroll). A page holds
+  // ~20 results, so more leads need more queries, not more depth.
+  const depth = options.depth || 1;
   const concurrency = options.concurrency || 2;
   const lang = options.lang || "pt";
   const timeoutMs = options.timeoutMs || 90000;
+  const idleMs = options.idleMs || 15000;
 
   const args = [
     "scrape",
@@ -522,20 +545,21 @@ export async function discoverLocalLeadsViaCli(
     let child: any;
     let stderrBuffer = "";
     let timedOut = false;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
 
+    // The scraper drives a browser that inherits its stdout, so the pipe (and
+    // "close") can outlive the scraper itself. Never wait for it: finish on
+    // limit, inactivity or timeout, and kill the whole process group.
     const timer = setTimeout(() => {
       timedOut = true;
-      if (child) {
-        try {
-          child.kill("SIGTERM");
-        } catch {}
-      }
+      finish(null);
     }, timeoutMs);
 
     try {
       child = spawn(binaryPath, args, {
         env,
         stdio: ["pipe", "pipe", "pipe"],
+        detached: true,
       });
     } catch (err: any) {
       clearTimeout(timer);
@@ -559,24 +583,37 @@ export async function discoverLocalLeadsViaCli(
       if (isResolved) return;
       isResolved = true;
       clearTimeout(timer);
+      clearTimeout(idleTimer);
       if (child) {
         try {
-          child.kill("SIGTERM");
-        } catch {}
+          process.kill(-child.pid, "SIGKILL"); // the scraper and its browser
+        } catch {
+          try { child.kill("SIGKILL"); } catch {}
+        }
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        child.unref?.();
       }
 
+      // maps-leads exits 0 even when every job failed; an empty run that logged
+      // errors is a failure, not "no businesses here".
+      const scraperError = leads.length === 0
+        ? (stderrBuffer.match(/"error":"([^"]+)"/)?.[1] ?? "")
+        : "";
       resolve({
-        success: leads.length > 0 || code === 0,
+        success: leads.length > 0 || (code === 0 && !timedOut && !scraperError),
         data: leads,
         total: leads.length,
         query: fullQuery,
         executionTimeMs: Date.now() - startTime,
         source: "cli",
         error:
-          leads.length === 0 && code !== 0
+          leads.length === 0 && (code !== 0 || scraperError)
             ? timedOut
               ? "Timed out while searching Google Maps."
-              : `Processo finalizou com erro (code ${code}): ${stderrBuffer.slice(0, 300)}`
+              : scraperError
+                ? `maps-leads failed: ${scraperError}`
+                : `Processo finalizou com erro (code ${code}): ${stderrBuffer.slice(0, 300)}`
             : undefined,
       });
     };
@@ -594,10 +631,12 @@ export async function discoverLocalLeadsViaCli(
         seenIds.add(dedupKey);
 
         let whatsappLink: string | undefined = undefined;
+        let whatsappSource: GoogleMapsLead["whatsapp_source"];
         if (Array.isArray(parsed.link_sources)) {
           for (const ls of parsed.link_sources) {
-            if (ls?.link && ls.link.includes("whatsapp.com")) {
+            if (ls?.link && /whatsapp\.com|wa\.me\//.test(ls.link)) {
               whatsappLink = ls.link;
+              whatsappSource = "google";
               break;
             }
           }
@@ -606,14 +645,16 @@ export async function discoverLocalLeadsViaCli(
         const phoneInfo = parsed.phone
           ? describeWhatsApp(parsed.phone, parsed.address, parsed.complete_address?.country)
           : undefined;
-        if (!whatsappLink) {
-          whatsappLink = phoneInfo?.link;
+        if (!whatsappLink && phoneInfo?.link) {
+          whatsappLink = phoneInfo.link;
+          whatsappSource = "phone";
         }
 
         const lead: GoogleMapsLead = {
           input_id: parsed.input_id,
           link: parsed.link,
           cid: parsed.cid,
+          place_id: parsed.place_id || undefined,
           title: parsed.title,
           category: parsed.category,
           categories: parsed.categories,
@@ -633,6 +674,7 @@ export async function discoverLocalLeadsViaCli(
           owner: parsed.owner,
           featured_image: parsed.featured_image,
           whatsapp_link: whatsappLink,
+          whatsapp_source: whatsappSource,
           phone_e164: phoneInfo?.valid ? phoneInfo.e164 : undefined,
           phone_type: phoneInfo?.type,
           emails: parsed.emails || undefined,
@@ -641,7 +683,10 @@ export async function discoverLocalLeadsViaCli(
         leads.push(lead);
         if (leads.length >= limit) {
           finish(0);
+          return;
         }
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => finish(0), idleMs);
       } catch {}
     };
 

@@ -25,6 +25,8 @@ Commands:
   maps <query> [location]     Discover local B2B prospects via the Google Maps engine.
   enrich <url>                Enrich a company website (emails, socials, decision makers).
   enrich-batch <file>         Enrich every website listed in a JSON file ({title, website}[]).
+  social <sub> ...            Read/write Facebook & Instagram through the logged-in
+                              Antigravity browser bridge (127.0.0.1:8765).
   serve                       Start the MCP server (stdio or SSE HTTP transport).
   --help, -h                  Show this help text.
   --version, -v               Show version number.
@@ -43,17 +45,31 @@ Options for 'extract':
 
 Options for 'contacts':
   --no-deep                   Skip crawling linked contact/about subpages.
+  --concurrency <n>           With several URLs: sites scanned in parallel (default 4, max 8).
+                              Several URLs print a JSON array; failures come back as { url, error }.
   --output, -o <file>         Write JSON output to a file.
 
 Options for 'maps':
   --email                     Let the scraper extract public emails (slower).
   --location <text>           Location passed to the Maps engine.
   --limit <n>                 Maximum leads (default: 20).
+  --lang <code>               Language for categories and labels (default: pt).
 
 Options for 'enrich-batch':
   --concurrency <n>           Parallel enrichments (default: 3).
   --mode <fast|deep>          Crawl mode (default: fast).
   --output, -o <file>         Write JSON array to a file.
+
+Subcommands for 'social':
+  doctor                      Bridge + login state of open tabs (never navigates).
+  fb-search "<query>"         Search Facebook posts.
+  fb-posts <group|page url>   Posts (and their comments) of a group or page.
+  ig-comments <post url>      Comments of an Instagram post.
+  ig-comment <post url> "<text>"  Comment on a post; dry run unless --live.
+  --reply-to <comment id>     Reply to that comment (ig-comment).
+  --live                      Actually publish (ig-comment). Default: dry run.
+  --limit <n>                 Maximum rows.
+  --output, -o <file>         Write JSON output to a file.
 
 Options for 'places':
   --limit <n>                 Maximum places to return (default: 5).
@@ -197,12 +213,31 @@ async function runCli() {
       console.error("Error: Missing target URL for 'contacts' command.");
       process.exit(1);
     }
-    const url = positionalUrls[0];
     const deepScan = !args.includes("--no-deep");
     const outputFile = getOption(args, "--output") || getOption(args, "-o");
 
     try {
-      const result = await extractContacts({ url, deepScan });
+      let result: unknown;
+      if (positionalUrls.length === 1) {
+        result = await extractContacts({ url: positionalUrls[0], deepScan });
+      } else {
+        // Many sites in one process: no per-site startup, bounded parallelism.
+        // A failing site yields { url, error } instead of aborting the batch.
+        const concurrency = Math.max(1, Math.min(8, parseInt(getOption(args, "--concurrency") || "4", 10) || 4));
+        const out: unknown[] = new Array(positionalUrls.length);
+        let next = 0;
+        await Promise.all(Array.from({ length: Math.min(concurrency, positionalUrls.length) }, async () => {
+          while (next < positionalUrls.length) {
+            const i = next++;
+            try {
+              out[i] = await extractContacts({ url: positionalUrls[i], deepScan });
+            } catch (err: any) {
+              out[i] = { url: positionalUrls[i], error: String(err?.message || err) };
+            }
+          }
+        }));
+        result = out;
+      }
       const outputJson = JSON.stringify(result, null, 2);
       if (outputFile) {
         await writeFile(outputFile, outputJson, "utf8");
@@ -212,6 +247,43 @@ async function runCli() {
       }
     } catch (err: any) {
       console.error(`Contacts extraction error: ${err.message || err}`);
+      process.exit(1);
+    }
+    return;
+  }
+
+  if (command === "social") {
+    const social = await import("./social.js");
+    const valueFlags = new Set(["--limit", "--reply-to", "--output", "-o"]);
+    const pos: string[] = [];
+    for (let i = 1; i < args.length; i++) {
+      if (valueFlags.has(args[i])) { i++; continue; }
+      if (!args[i].startsWith("-")) pos.push(args[i]);
+    }
+    const [sub, a1 = "", a2 = ""] = pos;
+    const limit = Number(getOption(args, "--limit")) || undefined;
+    const outputFile = getOption(args, "--output") || getOption(args, "-o");
+    const run: Record<string, () => Promise<unknown>> = {
+      doctor: () => social.socialDoctor(),
+      "fb-search": () => social.fbSearch(a1, limit),
+      "fb-posts": () => social.fbPosts(a1, limit),
+      "ig-comments": () => social.igComments(a1, limit),
+      "ig-comment": () => social.igComment(a1, a2, { replyTo: getOption(args, "--reply-to"), live: args.includes("--live") }),
+    };
+    if (!sub || !run[sub]) {
+      console.error(`Error: social subcommand must be one of: ${Object.keys(run).join(", ")}`);
+      process.exit(1);
+    }
+    try {
+      const outputJson = JSON.stringify(await run[sub](), null, 2);
+      if (outputFile) {
+        await writeFile(outputFile, outputJson, "utf8");
+        console.log(`Social output saved to ${outputFile}`);
+      } else {
+        console.log(outputJson);
+      }
+    } catch (err: any) {
+      console.error(`Social error: ${err.message || err}`);
       process.exit(1);
     }
     return;
@@ -274,6 +346,7 @@ async function runCli() {
         limit,
         fastMode: args.includes("--fast-mode"),
         extractEmails: args.includes("--email"),
+        lang: getOption(args, "--lang"),
       });
       const outputJson = JSON.stringify(res, null, 2);
       if (outputFile) {
@@ -540,6 +613,7 @@ function getPositionalArgs(args: string[], command: string): string[] {
     "--port",
     "--host",
     "--location",
+    "--lang",
     "--limit",
     "--title",
   ]);
