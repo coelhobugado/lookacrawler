@@ -1,5 +1,3 @@
-import { resolveMx as dnsResolveMx } from "node:dns/promises";
-
 export type EmailKind = "role" | "personal";
 
 export interface EmailInfo {
@@ -213,7 +211,8 @@ export async function checkMx(
   const cached = mxCache.get(key);
   if (cached && cached.expiresAt > now) return cached.ok;
 
-  const resolver = options.resolver || dnsResolveMx;
+  // Lazy import: loading dns/promises eagerly breaks test-setup.ts's lookup-only mock.
+  const resolver = options.resolver || (await import("node:dns/promises")).resolveMx;
   let ok: boolean;
   try {
     const records = await resolver(key);
