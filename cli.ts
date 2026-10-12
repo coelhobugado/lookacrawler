@@ -63,8 +63,8 @@ Options for 'places':
 
 Options for 'map':
   --max-urls <n>              Maximum discovered URLs to return (default: 1000).
-  --include <pattern>         Regex filter: only URLs matching pattern.
-  --exclude <pattern>         Regex filter: ignore URLs matching pattern.
+  --include <pattern>         Only URLs containing pattern (* = wildcard).
+  --exclude <pattern>         Ignore URLs containing pattern (* = wildcard).
   --output, -o <file>         Write JSON output to a file.
 
 Options for 'crawl':
@@ -74,8 +74,8 @@ Options for 'crawl':
   --link-format <fmt>         Link format: inline, references, or strip (default: inline)
   --image-mode <mode>         Image mode: markdown, alt_only, or ignore (default: markdown)
   --concurrency <n>           Parallel page crawl concurrency limit (default: 3).
-  --include <pattern>         Regex filter for allowed URLs.
-  --exclude <pattern>         Regex filter for forbidden URLs.
+  --include <pattern>         Allowed URL pattern (substring, * = wildcard).
+  --exclude <pattern>         Forbidden URL pattern (substring, * = wildcard).
   --output, -o <file>         Write JSON output to a file.
 
 Options for 'batch':
