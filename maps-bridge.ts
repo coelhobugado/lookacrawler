@@ -90,17 +90,18 @@ export interface MapsScrapeResult {
  * Locate the `maps-leads` executable across standard project paths.
  */
 export function resolveMapsLeadsBinary(customPath?: string): string | null {
-  if (customPath && fs.existsSync(customPath)) {
-    return customPath;
-  }
-  if (process.env.MAPS_LEADS_BIN && fs.existsSync(process.env.MAPS_LEADS_BIN)) {
-    return process.env.MAPS_LEADS_BIN;
+  // An explicit path that does not exist is a mistake to report, not a cue to
+  // silently run some other binary found on disk.
+  const explicit = customPath || process.env.MAPS_LEADS_BIN;
+  if (explicit) {
+    return fs.existsSync(explicit) ? explicit : null;
   }
 
-  // ponytail: no install step for a sibling binary. Add a `npx`-style fetch when
-  // the scraper ships as a real npm package; until then MAPS_LEADS_BIN wins.
+  // ponytail: build the vendored scraper with `bun run build:maps`; a
+  // prebuilt-binary download can come later. MAPS_LEADS_BIN still wins.
   const binaryName = process.platform === "win32" ? "maps-leads.exe" : "maps-leads";
   const candidates = [
+    path.resolve(__dirname, "google-maps-scraper", binaryName),
     path.resolve(__dirname, "../google-maps-scraper", binaryName),
     path.resolve(__dirname, "../../google-maps-scraper", binaryName),
     path.resolve(process.cwd(), "google-maps-scraper", binaryName),
